@@ -6530,13 +6530,13 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         self.assertGreater(_write_backup(cache, node, write_back=True), 0)
         cache.writing_check(write_back=True)
         self.assertTrue(node.backuped)
-        host_avail = cache.cache_controller.mem_pool_host.available_size()
+        host_avail = cache.cache_controller.host_cache_available_size()
 
         # Re-applying an overlapping chain is a no-op skip, not a re-backup.
         self.assertEqual(_write_backup(cache, node, write_back=True), 0)
         cache.writing_check(write_back=True)
         self.assertEqual(
-            cache.cache_controller.mem_pool_host.available_size(), host_avail
+            cache.cache_controller.host_cache_available_size(), host_avail
         )
 
     def test_shallower_crossing_backs_up_above_backuped_middle(self):
@@ -7070,13 +7070,13 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child_key = RadixKey(
             array("q", list(range(start_token, start_token + 2 * ps)))
         ).page_aligned(ps)
-        host_idx = cache.cache_controller.mem_pool_host.alloc(len(child_key))
+        host_idx = cache.cache_controller.alloc_host_cache(len(child_key))
         self.assertIsNotNone(host_idx, "host pool alloc failed")
         host_idx = host_idx.to(dtype=torch.int64)
         hashes = [f"h{i}" for i in range(len(child_key) // ps)]
         res = cache.tree_core.insert_host(parent_id, child_key, host_idx, hashes)
         if res.host_insert_dropped:
-            cache.cache_controller.mem_pool_host.free(host_idx)
+            cache.cache_controller.free_host_cache(host_idx)
         return res.inserted_host_node
 
     def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
@@ -7107,7 +7107,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             array("q", list(range(1000, 1000 + 2 * self.ps)))
         ).page_aligned(self.ps)
         completed_tokens = len(prefetch_key)
-        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        host_indices = cache.cache_controller.alloc_host_cache(completed_tokens)
         self.assertIsNotNone(host_indices)
 
         swa_transfer = PoolTransfer(

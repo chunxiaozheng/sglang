@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
@@ -201,6 +202,54 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
             controller.start_writing()
+
+    def test_host_cache_api_delegates_to_host_pool(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        host_pool = mock.Mock()
+        host_pool.available_size.return_value = 17
+        host_pool.alloc.return_value = mock.sentinel.host_indices
+        host_pool.free.return_value = 3
+        controller.mem_pool_host = host_pool
+
+        controller.clear_host_cache()
+        self.assertEqual(controller.host_cache_available_size(), 17)
+        self.assertIs(controller.alloc_host_cache(4), mock.sentinel.host_indices)
+        self.assertEqual(controller.free_host_cache(mock.sentinel.host_indices), 3)
+
+        host_pool.clear.assert_called_once_with()
+        host_pool.available_size.assert_called_once_with()
+        host_pool.alloc.assert_called_once_with(4)
+        host_pool.free.assert_called_once_with(mock.sentinel.host_indices)
+
+    def test_storage_api_delegates_to_enabled_backend(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        backend = mock.Mock()
+        backend.get_stats.return_value = mock.sentinel.storage_metrics
+        controller.enable_storage = True
+        controller.storage_backend = backend
+
+        self.assertTrue(controller.clear_storage_backend())
+        self.assertIs(
+            controller.get_storage_stats(), mock.sentinel.storage_metrics
+        )
+        backend.clear.assert_called_once_with()
+        backend.get_stats.assert_called_once_with()
+
+    def test_storage_api_handles_unavailable_backend(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.enable_storage = False
+        controller.storage_backend = None
+
+        self.assertFalse(controller.clear_storage_backend())
+        self.assertIsNone(controller.get_storage_stats())
+
+    def test_hiradix_clear_storage_backend_delegates_to_controller(self):
+        cache = object.__new__(HiRadixCache)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.clear_storage_backend.return_value = True
+
+        self.assertTrue(cache.clear_storage_backend())
+        cache.cache_controller.clear_storage_backend.assert_called_once_with()
 
     def test_hybrid_load_forwards_merged_pool_transfers(self):
         transfer = PoolTransfer(

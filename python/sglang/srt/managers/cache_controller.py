@@ -16,11 +16,13 @@ limitations under the License.
 import logging
 import threading
 import time
+from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.controllers import BaseController
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.common import RetractionBackup
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -259,7 +262,7 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-class HiCacheController:
+class HiCacheController(BaseController):
 
     def __init__(
         self,
@@ -368,6 +371,40 @@ class HiCacheController:
                 torch.distributed.get_world_size(group=self.attn_cp_group),
             )
         return 0, 1
+
+    def _host_pool_for_name(self, pool_name: Optional[PoolName] = None):
+        if pool_name is None:
+            return self.mem_pool_host
+        get_pool = getattr(self.mem_pool_host, "get_pool", None)
+        if get_pool is not None:
+            return get_pool(pool_name)
+        if pool_name == PoolName.KV:
+            return self.mem_pool_host
+        raise KeyError(f"Unknown host pool: {pool_name}")
+
+    def clear_host_cache(self) -> None:
+        self.mem_pool_host.clear()
+
+    def host_cache_available_size(
+        self, pool_name: Optional[PoolName] = None
+    ) -> int:
+        return self._host_pool_for_name(pool_name).available_size()
+
+    def alloc_host_cache(
+        self, num_slots: int, pool_name: Optional[PoolName] = None
+    ) -> Optional[torch.Tensor]:
+        return self._host_pool_for_name(pool_name).alloc(num_slots)
+
+    def free_host_cache(
+        self, indices: torch.Tensor, pool_name: Optional[PoolName] = None
+    ) -> int:
+        return self._host_pool_for_name(pool_name).free(indices)
+
+    def get_storage_stats(self):
+        if self.storage_backend is None:
+            return None
+        get_stats = getattr(self.storage_backend, "get_stats", None)
+        return get_stats() if get_stats is not None else None
 
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -632,6 +669,19 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+    def clear_storage_backend(self) -> bool:
+        if not self.enable_storage:
+            logger.warning("Hierarchical cache storage backend is not enabled.")
+            return False
+        if not hasattr(self.storage_backend, "clear"):
+            logger.warning(
+                "Storage backend %s does not support clear operation.",
+                type(self.storage_backend).__name__,
+            )
+            return False
+        self.storage_backend.clear()
+        return True
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -830,6 +880,19 @@ class HiCacheController:
             return op.host_indices, op.device_indices, op.pool_transfers
         return self._move_op_indices(op)
 
+    def _resolve_pool_transfers_allocation(
+        self,
+        extra_pools: Optional[list[PoolTransfer]],
+        alloc_host: bool,
+        kv_device_indices: Optional[torch.Tensor] = None,
+        kv_host_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[list[PoolTransfer]]:
+        if extra_pools:
+            raise ValueError(
+                f"{type(self).__name__} does not support auxiliary pool transfers"
+            )
+        return None
+
     def _move_op_indices(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
@@ -898,6 +961,116 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def backup_retraction(
+        self,
+        device_indices: torch.Tensor,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        reclaim_host: Optional[Callable[[int], int]] = None,
+        request_id: Optional[str] = None,
+    ) -> Optional[RetractionBackup]:
+        """Synchronously back up request KV before its device slots are freed."""
+        from sglang.srt.mem_cache.common import RetractionBackup
+
+        num_slots = len(device_indices)
+        host_indices = self.alloc_host_cache(num_slots)
+        if host_indices is None and reclaim_host is not None:
+            reclaim_host(num_slots)
+            host_indices = self.alloc_host_cache(num_slots)
+        if host_indices is None:
+            return None
+
+        resolved = self._resolve_pool_transfers_allocation(
+            extra_pools,
+            alloc_host=True,
+            kv_device_indices=device_indices,
+            kv_host_indices=host_indices,
+        )
+        if resolved is None and extra_pools:
+            self.free_host_cache(host_indices)
+            return None
+
+        backup = RetractionBackup(
+            host_indices=host_indices,
+            pool_transfers=[
+                replace(transfer, device_indices=None) for transfer in resolved or []
+            ]
+            or None,
+        )
+        operation = CacheOperation(
+            host_indices,
+            device_indices,
+            node_id=-1,
+            pool_transfers=resolved,
+        )
+        try:
+            write_host, write_device, write_pools = self._move_write_operation(
+                operation
+            )
+            completion = self.l2_transfer_engine.submit_device_to_host(
+                self._l2_transfers(write_host, write_device, write_pools)
+            )
+            completion.finish_event.synchronize()
+        except Exception:
+            self.discard_retraction(backup)
+            raise
+        return backup
+
+    def restore_retraction(
+        self,
+        backup: RetractionBackup,
+        device_indices: torch.Tensor,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        """Synchronously restore request KV into caller-provided device slots."""
+        assert backup.host_indices is not None
+        assert len(backup.host_indices) == len(device_indices), (
+            f"Host backup has {len(backup.host_indices)} slots, but restore has "
+            f"{len(device_indices)}"
+        )
+
+        current_by_name = {transfer.name: transfer for transfer in extra_pools or []}
+        saved_by_name = {
+            transfer.name: transfer for transfer in backup.pool_transfers or []
+        }
+        assert current_by_name.keys() == saved_by_name.keys(), (
+            f"Host backup pools {set(saved_by_name)} do not match restore pools "
+            f"{set(current_by_name)}"
+        )
+        restored_transfers = [
+            replace(saved, device_indices=current_by_name[name].device_indices)
+            for name, saved in saved_by_name.items()
+        ]
+        resolved = self._resolve_pool_transfers_allocation(
+            restored_transfers or None,
+            alloc_host=False,
+            kv_device_indices=device_indices,
+            kv_host_indices=backup.host_indices,
+        )
+        assert resolved is not None or not restored_transfers
+
+        operation = CacheOperation(
+            backup.host_indices,
+            device_indices,
+            node_id=-1,
+            pool_transfers=resolved,
+        )
+        load_host, load_device, load_pools = self._move_op_indices(operation)
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            self._l2_load_transfers(load_host, load_device, load_pools),
+            layer_num=self.layer_num,
+        )
+        completion.finish_event.synchronize()
+        self.discard_retraction(backup)
+
+    def discard_retraction(self, backup: RetractionBackup) -> None:
+        """Release all host-pool slots held by a retraction backup."""
+        if backup.host_indices is not None:
+            self.free_host_cache(backup.host_indices)
+        for transfer in backup.pool_transfers or []:
+            if transfer.indices_from_pool is None and transfer.host_indices is not None:
+                self.free_host_cache(transfer.host_indices, transfer.name)
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

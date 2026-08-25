@@ -4,7 +4,6 @@ import atexit
 import logging
 import threading
 import time
-from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -12,7 +11,6 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -34,6 +32,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.controllers import BaseController
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -229,7 +228,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
-        self.cache_controller: Optional[HybridCacheController] = None
+        self.cache_controller: Optional[BaseController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
@@ -356,7 +355,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
-            self.cache_controller.mem_pool_host.clear()
+            self.cache_controller.clear_host_cache()
             self.enable_storage = self.cache_controller.enable_storage
 
         self.tree_core.kv_events.record_all_cleared()
@@ -1131,103 +1130,23 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
-
-        resolved = self.cache_controller._resolve_pool_transfers_allocation(
-            extra_transfers or None,
-            alloc_host=True,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-        )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
-            return None
-
-        backup = RetractionBackup(
-            host_indices=host_indices,
-            pool_transfers=[replace(x, device_indices=None) for x in resolved or []]
-            or None,
-        )
-        operation = CacheOperation(
-            host_indices,
+        return self.cache_controller.backup_retraction(
             device_indices,
-            node_id=-1,
-            pool_transfers=resolved,
+            extra_transfers or None,
+            reclaim_host=self._reclaim_retraction_host,
+            request_id=req.rid,
         )
-        try:
-            write_host, write_device, write_pools = (
-                self.cache_controller._move_write_operation(operation)
-            )
-            completion = self.cache_controller.l2_transfer_engine.submit_device_to_host(
-                self.cache_controller._l2_transfers(
-                    write_host, write_device, write_pools
-                )
-            )
-            completion.finish_event.synchronize()
-        except Exception:
-            self.retraction_discard(backup)
-            raise
-        return backup
 
     def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
-        assert len(backup.host_indices) == len(device_indices), (
-            f"Host backup has {len(backup.host_indices)} slots, but restore has "
-            f"{len(device_indices)}"
-        )
-
-        current_by_name = {transfer.name: transfer for transfer in current_transfers}
-        saved_by_name = {
-            transfer.name: transfer for transfer in backup.pool_transfers or []
-        }
-        assert current_by_name.keys() == saved_by_name.keys(), (
-            f"Host backup pools {set(saved_by_name)} do not match restore pools "
-            f"{set(current_by_name)}"
-        )
-        restored_transfers = [
-            replace(
-                saved,
-                device_indices=current_by_name[name].device_indices,
-            )
-            for name, saved in saved_by_name.items()
-        ]
-        resolved = self.cache_controller._resolve_pool_transfers_allocation(
-            restored_transfers or None,
-            alloc_host=False,
-            kv_device_indices=device_indices,
-            kv_host_indices=backup.host_indices,
-        )
-        assert resolved is not None or not restored_transfers
-
-        operation = CacheOperation(
-            backup.host_indices,
+        self.cache_controller.restore_retraction(
+            backup,
             device_indices,
-            node_id=-1,
-            pool_transfers=resolved,
+            current_transfers or None,
         )
-        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
-            operation
-        )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            layer_num=self.cache_controller.layer_num,
-        )
-        completion.finish_event.synchronize()
-        self.retraction_discard(backup)
 
     def retraction_discard(self, backup: RetractionBackup) -> None:
-        self.host_pool_group.free(backup.host_indices)
-        for transfer in backup.pool_transfers or []:
-            if transfer.indices_from_pool is None:
-                assert transfer.host_indices is not None
-                self.host_pool_group.get_pool(transfer.name).free(transfer.host_indices)
+        self.cache_controller.discard_retraction(backup)
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -1276,7 +1195,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
+        host_avail = self.cache_controller.host_cache_available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
@@ -1830,7 +1749,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
 
-            self.cache_controller.mem_pool_host.free(
+            self.cache_controller.free_host_cache(
                 host_indices[: insert_result.prefix_len]
             )
             self.cache_controller.append_host_mem_release(
@@ -2136,20 +2055,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 # ongoing_prefetch, so wait_complete keeps gating admission.
                 return False
             alloc_len = operation.storage_hit_count
-            host_indices = cc.mem_pool_host.alloc(alloc_len)
+            host_indices = cc.alloc_host_cache(alloc_len)
             if host_indices is None:
                 self.evict_host(alloc_len)
-                host_indices = cc.mem_pool_host.alloc(alloc_len)
+                host_indices = cc.alloc_host_cache(alloc_len)
             if host_indices is None and not buffer_mode:
                 # Memory-pressure fallback: a shorter page-aligned prefix.
                 # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
+                available_size = cc.host_cache_available_size()
                 alloc_len = min(
                     operation.storage_hit_count,
                     available_size - (available_size % self.page_size),
                 )
                 if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                    host_indices = cc.alloc_host_cache(alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     return False
@@ -2231,7 +2150,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices_list.append(host_indices)
                 released_tokens += len(host_indices)
             if host_indices_list:
-                cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+                cc.free_host_cache(torch.cat(host_indices_list, dim=0))
             return len(host_indices_list), released_tokens
 
         def _drain_extra_release():
@@ -2248,9 +2167,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     host_indices_list.append(host_indices)
                     released_tokens += len(host_indices)
                 if host_indices_list:
-                    entry = cc.mem_pool_host.entry_map.get(pool_name)
-                    if entry is not None:
-                        entry.host_pool.free(torch.cat(host_indices_list, dim=0))
+                    cc.free_host_cache(
+                        torch.cat(host_indices_list, dim=0), pool_name
+                    )
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
@@ -2630,7 +2549,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
-            storage_metrics = self.cache_controller.storage_backend.get_stats()
+            storage_metrics = self.cache_controller.get_storage_stats()
             if storage_metrics is None:
                 # Backends without native stats (e.g. file) still carry the
                 # controller-side prefetch outcome counters.

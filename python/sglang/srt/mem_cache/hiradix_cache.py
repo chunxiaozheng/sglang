@@ -540,7 +540,7 @@ class HiRadixCache(RadixCache):
 
                 try:
                     if _operation.host_indices is not None:
-                        cc.mem_pool_host.free(_operation.host_indices)
+                        cc.free_host_cache(_operation.host_indices)
                 except Exception:
                     logger.exception(
                         "Failed to free host indices for prefetch %s", req_id
@@ -636,19 +636,19 @@ class HiRadixCache(RadixCache):
                     continue
 
                 alloc_len = operation.storage_hit_count
-                host_indices = cc.mem_pool_host.alloc(alloc_len)
+                host_indices = cc.alloc_host_cache(alloc_len)
                 if host_indices is None:
                     self.evict_host(alloc_len)
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                    host_indices = cc.alloc_host_cache(alloc_len)
                 if host_indices is None:
                     # Memory-pressure fallback: a shorter page-aligned prefix.
-                    available_size = cc.mem_pool_host.available_size()
+                    available_size = cc.host_cache_available_size()
                     alloc_len = min(
                         operation.storage_hit_count,
                         available_size - (available_size % self.page_size),
                     )
                     if alloc_len >= self.prefetch_threshold:
-                        host_indices = cc.mem_pool_host.alloc(alloc_len)
+                        host_indices = cc.alloc_host_cache(alloc_len)
                 if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
                     logger.debug(
@@ -680,7 +680,7 @@ class HiRadixCache(RadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
-                cc.mem_pool_host.free(host_indices)
+                cc.free_host_cache(host_indices)
 
         _drain_and_alloc_storage_hit()
         _drain_backup()
@@ -821,26 +821,14 @@ class HiRadixCache(RadixCache):
         return {}
 
     def clear_storage_backend(self) -> bool:
-        if self.enable_storage:
-            try:
-                # Check if the storage backend has a clear method (for nixl backends)
-                if hasattr(self.cache_controller.storage_backend, "clear"):
-                    self.cache_controller.storage_backend.clear()
-                    logger.info(
-                        "Hierarchical cache storage backend cleared successfully!"
-                    )
-                    return True
-                else:
-                    logger.warning(
-                        f"Storage backend {type(self.cache_controller.storage_backend).__name__} does not support clear operation."
-                    )
-                    return False
-            except Exception as e:
-                logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
-                return False
-        else:
-            logger.warning("Hierarchical cache storage backend is not enabled.")
+        try:
+            ok = self.cache_controller.clear_storage_backend()
+        except Exception as e:
+            logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
             return False
+        if ok:
+            logger.info("Hierarchical cache storage backend cleared successfully!")
+        return ok
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
@@ -1549,9 +1537,9 @@ class HiRadixCache(RadixCache):
                     log_metrics=True,
                 )
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
-                self.cache_controller.storage_backend.get_stats()
-            )
+            storage_metrics = self.cache_controller.get_storage_stats()
+            if storage_metrics is not None:
+                self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def drain_storage_control_queues(self):
         """
@@ -1672,7 +1660,7 @@ class HiRadixCache(RadixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
-        self.cache_controller.mem_pool_host.free(
+        self.cache_controller.free_host_cache(
             operation.host_indices[:matched_length]
         )
         self.cache_controller.append_host_mem_release(
