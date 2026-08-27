@@ -18,7 +18,12 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -82,6 +87,49 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     server_args = ctx.server_args
     params = ctx.params
 
+    if get_memory().enable_lmcache:
+        if ctx.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-lmcache and --enable-hierarchical-cache are "
+                "mutually exclusive"
+            )
+        if ctx.disable_radix_cache:
+            raise ValueError("--enable-lmcache requires radix cache to be enabled")
+        if params.is_eagle:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support EAGLE bigram keys"
+            )
+        if params.mtp_draft_device_pools:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet transfer MTP draft KV pools"
+            )
+        if get_parallel().enable_dp_attention:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support DP attention"
+            )
+        if ctx.server_args.enable_streaming_session:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support streaming sessions"
+            )
+        if ctx.server_args.hicache_host_memory_mode == "buffer_only":
+            raise ValueError(
+                "--hicache-host-memory-mode=buffer_only is a HiCache-only mode"
+            )
+        if get_disagg().disaggregation_mode != "null":
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache currently supports colocated "
+                "prefill/decode scheduling only"
+            )
+        if ctx.is_hybrid_swa or ctx.is_hybrid_ssm or ctx.is_dsa:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache currently supports FULL-attention "
+                "models without SWA, Mamba, or DSA sidecar pools"
+            )
+        if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support C128 sidecar pools"
+            )
+
     if (
         ctx.disable_radix_cache
         and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
@@ -101,6 +149,21 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
+    if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        params.tree_components = (ComponentType.FULL,)
+        return LMCacheUnifiedRadixCache(
+            params,
+            model_config=ctx.model_config,
+            tp_size=ctx.tp_size,
+            tp_rank=ctx.tp_rank,
+            lmcache_config_file=get_memory().lmcache_config_file,
+        )
+
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
         from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -115,19 +178,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
-
-    if get_memory().enable_lmcache:
-        from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-            LMCRadixCache,
-        )
-
-        return LMCRadixCache(
-            params=params,
-            model_config=ctx.model_config,
-            tp_size=ctx.tp_size,
-            rank=ctx.tp_rank,
-            tp_group=ctx.tp_group,
-        )
 
     if get_memory().enable_flexkv:
         # Importing the package side-effect registers the explicit
