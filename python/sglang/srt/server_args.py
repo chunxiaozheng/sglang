@@ -7978,7 +7978,14 @@ class ServerArgs:
             )
 
     def _resolve_hicache_dcp_compatibility(self):
-        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+        if self.dcp_size <= 1:
+            return
+        if self.enable_lmcache:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation."
+            )
+        if not self.enable_hierarchical_cache:
             return
         if self.hicache_storage_backend is not None:
             raise NotImplementedError(
@@ -7993,11 +8000,6 @@ class ServerArgs:
                 "HiCache with --dcp-size > 1 only supports DSPARK speculative "
                 "decoding; other draft-model host pools have no DCP index "
                 "translation."
-            )
-        if self.enable_lmcache:
-            raise NotImplementedError(
-                "--enable-lmcache with --dcp-size > 1 is not supported: "
-                "LMCache has no DCP-aware index translation."
             )
         if self.enable_hisparse:
             raise NotImplementedError(
