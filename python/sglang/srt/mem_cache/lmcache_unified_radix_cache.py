@@ -12,6 +12,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import logging
+from array import array
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -173,7 +174,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         extra_key = extra_key or anchor_extra_key
         cache_salt = cache_salt or anchor_cache_salt
         key = RadixKey(
-            token_ids,
+            array("q", token_ids),
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
