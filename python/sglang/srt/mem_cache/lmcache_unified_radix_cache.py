@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.connectors.lmcache import (
+    LMCacheKVGroup,
     LMCacheLoadOperation,
     LMCacheLookupOperation,
     LMCacheMPConnector,
@@ -62,7 +63,7 @@ class _PendingStore:
 
 
 class LMCacheUnifiedRadixCache(UnifiedRadixCache):
-    """FULL-attention Unified radix tree with device-direct LMCache MP I/O."""
+    """Unified radix tree with device-direct LMCache MP attention-KV I/O."""
 
     def __init__(
         self,
@@ -73,10 +74,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         tp_rank: int,
         lmcache_config_file: Optional[str],
     ) -> None:
-        if tuple(params.tree_components or ()) != (ComponentType.FULL,):
+        components = tuple(params.tree_components or ())
+        if not components or components[0] is not ComponentType.FULL:
             raise NotImplementedError(
-                "LMCacheUnifiedRadixCache currently supports FULL-attention "
-                "Unified trees only"
+                "LMCacheUnifiedRadixCache requires FULL as its base component"
+            )
+        unsupported = set(components) - {ComponentType.FULL, ComponentType.SWA}
+        if unsupported:
+            names = ", ".join(sorted(component.name for component in unsupported))
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support non-attention "
+                f"components: {names}"
             )
         if params.pp_size != 1:
             raise NotImplementedError(
@@ -84,7 +92,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
 
         super().__init__(params)
-        kv_tensors, is_mla = self._resolve_registered_tensors()
+        kv_groups = self._resolve_registered_groups()
+        self._lmcache_component_types = tuple(self.tree_components)
         self.lmcache_connector = LMCacheMPConnector(
             config_file=lmcache_config_file,
             model_name=model_config.model_path,
@@ -92,8 +101,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             worker_id=tp_rank,
             tp_group=params.tp_cache_group,
             page_size=self.page_size,
-            kv_tensors=kv_tensors,
-            is_mla=is_mla,
+            kv_groups=kv_groups,
         )
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._pending_stores: list[_PendingStore] = []
@@ -105,15 +113,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self.hicache_storage_pass_prefix_keys = False
         atexit.register(self.shutdown)
 
-    def _resolve_registered_tensors(self) -> tuple[list[torch.Tensor], bool]:
-        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+    @staticmethod
+    def _resolve_pool_tensors(kv_pool) -> tuple[torch.Tensor, ...]:
         if getattr(kv_pool, "use_dsa", False):
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache does not yet register DSA indexer pools"
             )
         kv_buffer = getattr(kv_pool, "kv_buffer", None)
         if kv_buffer is not None:
-            return list(kv_buffer), True
+            if not kv_buffer:
+                raise NotImplementedError("LMCache cannot register an empty MLA pool")
+            return tuple(kv_buffer)
 
         k_buffer = getattr(kv_pool, "k_buffer", None)
         v_buffer = getattr(kv_pool, "v_buffer", None)
@@ -125,7 +135,57 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache currently supports NHD MHA pools only"
             )
-        return [*k_buffer, *v_buffer], False
+        return tuple([*k_buffer, *v_buffer])
+
+    def _resolve_registered_groups(self) -> list[LMCacheKVGroup]:
+        """Map Unified tree components to LMCache engine KV groups."""
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        groups: list[LMCacheKVGroup] = []
+        for component_type in self.tree_components:
+            if component_type is ComponentType.FULL:
+                component_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
+                sliding_window_size = -1
+            elif component_type is ComponentType.SWA:
+                component_pool = getattr(kv_pool, "swa_kv_pool", None)
+                if component_pool is None:
+                    raise NotImplementedError(
+                        f"SWA component requires an SWA KV sub-pool, got "
+                        f"{type(kv_pool).__name__}"
+                    )
+                sliding_window_size = self._aligned_swa_window_size()
+            else:
+                raise AssertionError(f"Unexpected LMCache component {component_type}")
+            groups.append(
+                LMCacheKVGroup(
+                    name=component_type.name.lower(),
+                    kv_tensors=self._resolve_pool_tensors(component_pool),
+                    sliding_window_size=sliding_window_size,
+                )
+            )
+        return groups
+
+    def _aligned_swa_window_size(self) -> int:
+        assert self._sliding_window_size is not None
+        return (
+            (self._sliding_window_size + self.page_size - 1)
+            // self.page_size
+            * self.page_size
+        )
+
+    def _device_indices_by_group(
+        self, full_indices: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Translate tree FULL ids into each component's physical address space."""
+        allocator = self.token_to_kv_pool_allocator
+        result: list[torch.Tensor] = []
+        for component_type in self._lmcache_component_types:
+            if component_type is ComponentType.FULL:
+                result.append(allocator.translate_kv_indices_for_transfer(full_indices))
+            elif component_type is ComponentType.SWA:
+                result.append(allocator.translate_loc_from_full_to_swa(full_indices))
+            else:
+                raise AssertionError(f"Unexpected LMCache component {component_type}")
+        return result
 
     # ------------------------------------------------------------------
     # Lookup + asynchronous retrieve
@@ -195,9 +255,50 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def _allocate_external_slots(self, num_tokens: int) -> Optional[torch.Tensor]:
-        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+        allocator = self.token_to_kv_pool_allocator
+        if not self.is_swa_enabled:
+            if allocator.available_size() < num_tokens:
+                self.evict(EvictParams(num_tokens=num_tokens))
+            return allocator.alloc(num_tokens)
+
+        # Only the final SWA window is consumed by attention.  Allocate FULL
+        # slots for the complete external suffix, but SWA slots only for its
+        # page-aligned tail; older SWA block IDs are routed to dummy page 0.
+        assert self._sliding_window_size is not None
+        swa_tail_tokens = min(
+            num_tokens,
+            self._aligned_swa_window_size(),
+        )
+        full_allocator = allocator.full_attn_allocator
+        swa_allocator = allocator.swa_attn_allocator
+        if full_allocator.available_size() < num_tokens:
             self.evict(EvictParams(num_tokens=num_tokens))
-        return self.token_to_kv_pool_allocator.alloc(num_tokens)
+        if swa_allocator.available_size() < swa_tail_tokens:
+            self.evict(EvictParams(swa_num_tokens=swa_tail_tokens))
+
+        full_indices = full_allocator.alloc(num_tokens)
+        if full_indices is None:
+            return None
+        if swa_tail_tokens == 0:
+            return full_indices
+
+        tail_full_indices = full_indices[-swa_tail_tokens:]
+        if hasattr(swa_allocator, "alloc_with_virtual"):
+            # Unified-memory SWA uses the same virtual page ids on both sides.
+            virtual_pages = torch.unique(tail_full_indices // self.page_size)
+            try:
+                swa_allocator.alloc_with_virtual(virtual_pages)
+            except Exception:
+                full_allocator.free(full_indices)
+                logger.exception("Failed to allocate unified SWA slots for LMCache")
+                return None
+        else:
+            swa_indices = swa_allocator.alloc(swa_tail_tokens)
+            if swa_indices is None:
+                full_allocator.free(full_indices)
+                return None
+            allocator.set_full_to_swa_mapping(tail_full_indices, swa_indices)
+        return full_indices
 
     def _start_external_load(self, flow: _ExternalFlow, total_hit: int) -> bool:
         latest = super().match_prefix(MatchPrefixParams(key=flow.key))
@@ -234,8 +335,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         try:
             flow.load = self.lmcache_connector.submit_load(
                 flow.lookup,
-                device_indices,
+                self._device_indices_by_group(device_indices),
                 local_hit_tokens=local_hit,
+                owned_device_indices=device_indices,
             )
         except Exception:
             self.token_to_kv_pool_allocator.free(device_indices)
@@ -315,6 +417,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     key=flow.key[:total_hit],
                     value=combined,
                     prev_prefix_len=local_hit,
+                    swa_evicted_seqlen=(
+                        max(0, total_hit - self._aligned_swa_window_size())
+                        if self.is_swa_enabled
+                        else 0
+                    ),
                 )
             )
         elif suffix.numel():
@@ -355,7 +462,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             operation = self.lmcache_connector.submit_store(
                 req.rid,
                 key.raw_token_ids()[: len(key)],
-                matched.device_indices[: len(key)],
+                self._device_indices_by_group(matched.device_indices[: len(key)]),
                 cache_salt=self._external_cache_salt(
                     req.cache_salt, req.extra_key
                 ),

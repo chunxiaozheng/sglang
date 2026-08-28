@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.connectors.lmcache.mp_connector import (
+    LMCacheKVGroup,
     LMCacheLookupOperation,
     LMCacheLoadOperation,
     LMCacheMPConnector,
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
     LMCacheUnifiedRadixCache,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
 
 class _Future:
@@ -29,6 +31,18 @@ class _Future:
 
     def query(self):
         return self.ready
+
+    def retain_reference(self, value):
+        self.value = value
+
+
+class _TransferContext:
+    def __init__(self):
+        self.store_args = None
+
+    def submit_store(self, *args):
+        self.store_args = args
+        return _Future(True)
 
 
 class _IPCCacheServerKey:
@@ -66,6 +80,107 @@ class TestLMCacheMPConnector(unittest.TestCase):
     def test_slots_to_blocks_rejects_unaligned_page(self):
         with self.assertRaisesRegex(ValueError, "page-aligned"):
             self.connector._slots_to_blocks(torch.tensor([5, 6, 7, 8]))
+
+    def test_slots_to_blocks_accepts_explicit_dummy_page_for_load(self):
+        slots = torch.tensor([0, 0, 0, 0, 8, 9, 10, 11])
+        self.assertEqual(
+            self.connector._slots_to_blocks(slots, allow_dummy_page=True), [0, 2]
+        )
+
+    def test_component_block_ids_expand_to_kernel_groups(self):
+        self.connector._kv_groups = (object(), object())
+        self.connector._kernel_group_to_engine_group = (0, 1, 1)
+        block_ids = self.connector._block_ids_for_transfer(
+            [
+                torch.tensor([4, 5, 6, 7, 12, 13, 14, 15]),
+                torch.tensor([8, 9, 10, 11, 16, 17, 18, 19]),
+            ],
+            allow_dummy_page=False,
+        )
+        self.assertEqual(block_ids, [[1, 3], [2, 4], [2, 4]])
+
+    def test_group_info_specs_preserve_component_address_spaces(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector.page_size = 4
+        connector._kv_groups = (
+            LMCacheKVGroup(
+                "full",
+                (
+                    torch.empty(20, 1, 8),
+                    torch.empty(20, 1, 8),
+                ),
+            ),
+            LMCacheKVGroup(
+                "swa",
+                (
+                    torch.empty(12, 1, 8),
+                    torch.empty(12, 1, 16),
+                ),
+                sliding_window_size=8,
+            ),
+        )
+
+        specs, kernel_to_engine = connector._build_engine_group_info_specs()
+
+        self.assertEqual(kernel_to_engine, (0, 1, 1))
+        self.assertEqual(
+            [spec["layer_indices"] for spec in specs], [(0, 1), (2,), (3,)]
+        )
+        self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
+
+    def test_submit_store_passes_list_of_block_ids_per_group(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector.page_size = 4
+        connector.chunk_size = 8
+        connector.blocks_in_chunk = 2
+        connector.worker_id = 0
+        connector.instance_id = 1
+        connector._kv_groups = (object(), object())
+        connector._kernel_group_to_engine_group = (0, 1)
+        connector._store_submitted_tokens = {}
+        connector._active_sessions = set()
+        connector._kv_caches = {}
+        connector._transfer_ctx = _TransferContext()
+        connector._new_event = lambda: object()
+        connector._create_key = lambda *args, **kwargs: object()
+
+        operation = connector.submit_store(
+            "request",
+            list(range(8)),
+            [
+                torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]),
+                torch.tensor([12, 13, 14, 15, 20, 21, 22, 23]),
+            ],
+            cache_salt="",
+        )
+
+        self.assertIsNotNone(operation)
+        self.assertEqual(
+            connector._transfer_ctx.store_args[4],
+            [[1, 2], [3, 5]],
+        )
+
+    def test_submit_store_defers_unmapped_swa_page(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector.page_size = 4
+        connector.chunk_size = 8
+        connector._kv_groups = (object(), object())
+        connector._kernel_group_to_engine_group = (0, 1)
+        connector._store_submitted_tokens = {}
+        connector._active_sessions = set()
+
+        operation = connector.submit_store(
+            "request",
+            list(range(8)),
+            [
+                torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]),
+                torch.tensor([0, 0, 0, 0, 12, 13, 14, 15]),
+            ],
+            cache_salt="",
+        )
+
+        self.assertIsNone(operation)
+        self.assertNotIn("request", connector._store_submitted_tokens)
 
     def test_completed_operation_does_not_requery_future(self):
         operation = object.__new__(LMCacheLoadOperation)
@@ -113,6 +228,94 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertIsInstance(flow_key.token_ids, array)
         tree_key = RadixKey(array("q", [1, 2, 3, 4]))
         self.assertEqual(tree_key.match(flow_key), 4)
+
+    def test_resolve_registered_groups_maps_full_and_swa_subpools(self):
+        class _Pool:
+            kv_cache_layout = "nhd"
+
+            def __init__(self, width):
+                self.k_buffer = [torch.empty(12, 2, width)]
+                self.v_buffer = [torch.empty(12, 2, width)]
+
+        class _CompositePool:
+            full_kv_pool = _Pool(8)
+            swa_kv_pool = _Pool(4)
+
+        class _Allocator:
+            @staticmethod
+            def get_kvcache():
+                return _CompositePool()
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache.tree_components = (ComponentType.FULL, ComponentType.SWA)
+        cache._sliding_window_size = 6
+        cache.page_size = 4
+
+        groups = cache._resolve_registered_groups()
+
+        self.assertEqual([group.name for group in groups], ["full", "swa"])
+        self.assertEqual([len(group.kv_tensors) for group in groups], [2, 2])
+        self.assertEqual([group.sliding_window_size for group in groups], [-1, 8])
+
+    def test_device_indices_are_translated_per_component(self):
+        class _Allocator:
+            @staticmethod
+            def translate_kv_indices_for_transfer(indices):
+                return indices + 100
+
+            @staticmethod
+            def translate_loc_from_full_to_swa(indices):
+                return indices + 200
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache._lmcache_component_types = (ComponentType.FULL, ComponentType.SWA)
+
+        groups = cache._device_indices_by_group(torch.tensor([4, 5]))
+
+        self.assertTrue(torch.equal(groups[0], torch.tensor([104, 105])))
+        self.assertTrue(torch.equal(groups[1], torch.tensor([204, 205])))
+
+    def test_external_swa_allocation_only_allocates_window_tail(self):
+        class _SubAllocator:
+            def __init__(self, start):
+                self.start = start
+                self.alloc_sizes = []
+
+            @staticmethod
+            def available_size():
+                return 100
+
+            def alloc(self, size):
+                self.alloc_sizes.append(size)
+                return torch.arange(self.start, self.start + size)
+
+            def free(self, _indices):
+                pass
+
+        class _Allocator:
+            def __init__(self):
+                self.full_attn_allocator = _SubAllocator(4)
+                self.swa_attn_allocator = _SubAllocator(100)
+                self.mapping = None
+
+            def set_full_to_swa_mapping(self, full, swa):
+                self.mapping = (full, swa)
+
+        allocator = _Allocator()
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.is_swa_enabled = True
+        cache._sliding_window_size = 6
+        cache.page_size = 4
+
+        full = cache._allocate_external_slots(12)
+
+        self.assertEqual(allocator.full_attn_allocator.alloc_sizes, [12])
+        self.assertEqual(allocator.swa_attn_allocator.alloc_sizes, [8])
+        self.assertTrue(torch.equal(full, torch.arange(4, 16)))
+        self.assertTrue(torch.equal(allocator.mapping[0], torch.arange(8, 16)))
 
 
 if __name__ == "__main__":

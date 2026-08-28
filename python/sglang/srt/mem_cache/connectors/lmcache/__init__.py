@@ -1,4 +1,5 @@
 from sglang.srt.mem_cache.connectors.lmcache.mp_connector import (
+    LMCacheKVGroup,
     LMCacheLoadOperation,
     LMCacheLookupOperation,
     LMCacheMPConnector,
@@ -6,9 +7,9 @@ from sglang.srt.mem_cache.connectors.lmcache.mp_connector import (
 )
 
 __all__ = [
+    "LMCacheKVGroup",
     "LMCacheLoadOperation",
     "LMCacheLookupOperation",
     "LMCacheMPConnector",
     "LMCacheStoreOperation",
 ]
-

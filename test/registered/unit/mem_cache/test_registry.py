@@ -418,9 +418,40 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             default_radix_cache_factory(ctx)
 
-    def test_lmcache_rejects_hybrid_components(self):
+    def test_lmcache_supports_hybrid_swa_components(self):
         ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_swa=True)
-        with self.assertRaisesRegex(NotImplementedError, "FULL-attention"):
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.SWA,
+            ),
+        )
+
+    def test_lmcache_rejects_hybrid_ssm_components(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_ssm=True)
+        with self.assertRaisesRegex(NotImplementedError, "Mamba"):
+            default_radix_cache_factory(ctx)
+
+    def test_lmcache_rejects_pure_swa(self):
+        ctx = _make_ctx(
+            self,
+            enable_lmcache=True,
+            is_hybrid_swa=True,
+            full_tokens_per_layer=0,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "pure-SWA"):
             default_radix_cache_factory(ctx)
 
 
