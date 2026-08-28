@@ -310,6 +310,10 @@ class LMCacheMPConnector:
             model_name=self.model_name,
             world_size=self.world_size,
             worker_id=worker_id,
+            # TODO(chunxiaozheng): optimie MLA
+            # Each TP rank registers and retrieves its own worker_id-scoped
+            # object, so every stored KV object has exactly one reader.
+            num_kv_readers=1,
             token_ids=tuple(operation.token_ids),
             start=start,
             end=end,
