@@ -120,10 +120,14 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "LMCacheUnifiedRadixCache currently supports colocated "
                 "prefill/decode scheduling only"
             )
-        if ctx.is_hybrid_swa or ctx.is_hybrid_ssm or ctx.is_dsa:
+        if ctx.is_hybrid_ssm or ctx.is_dsa:
             raise NotImplementedError(
-                "LMCacheUnifiedRadixCache currently supports FULL-attention "
-                "models without SWA, Mamba, or DSA sidecar pools"
+                "LMCacheUnifiedRadixCache does not yet support Mamba or DSA "
+                "sidecar components"
+            )
+        if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support pure-SWA models"
             )
         if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
             raise NotImplementedError(
@@ -155,7 +159,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         )
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
-        params.tree_components = (ComponentType.FULL,)
+        tree_components = [ComponentType.FULL]
+        if ctx.is_hybrid_swa:
+            tree_components.append(ComponentType.SWA)
+        params.tree_components = tuple(tree_components)
         return LMCacheUnifiedRadixCache(
             params,
             model_config=ctx.model_config,

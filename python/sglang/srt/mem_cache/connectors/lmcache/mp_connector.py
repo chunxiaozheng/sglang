@@ -53,6 +53,20 @@ class LMCacheLookupOperation:
     lock_start: int = 0
 
 
+@dataclass(frozen=True)
+class LMCacheKVGroup:
+    """One SGLang KV address space exposed as one LMCache engine group.
+
+    ``kv_tensors`` are registered as independent, single-plane byte-equivalent
+    views.  This keeps SGLang's separately allocated K and V buffers zero-copy
+    while giving every component a stable per-group block-id namespace.
+    """
+
+    name: str
+    kv_tensors: tuple[torch.Tensor, ...]
+    sliding_window_size: int = -1
+
+
 @dataclass
 class LMCacheLoadOperation:
     request_id: str
@@ -93,8 +107,7 @@ class LMCacheMPConnector:
         worker_id: int,
         tp_group: Optional[dist.ProcessGroup],
         page_size: int,
-        kv_tensors: list[torch.Tensor],
-        is_mla: bool,
+        kv_groups: list[LMCacheKVGroup],
     ) -> None:
         try:
             import zmq
@@ -106,8 +119,9 @@ class LMCacheMPConnector:
                 "a running LMCache multiprocess server."
             ) from exc
 
-        if not kv_tensors:
-            raise ValueError("LMCache KV tensor registration cannot be empty")
+        if not kv_groups or any(not group.kv_tensors for group in kv_groups):
+            raise ValueError("LMCache KV group registration cannot be empty")
+        kv_tensors = [tensor for group in kv_groups for tensor in group.kv_tensors]
         if any(t.device.type != "cuda" for t in kv_tensors):
             raise NotImplementedError("LMCache MP currently requires CUDA KV tensors")
         if any(t.device != kv_tensors[0].device for t in kv_tensors):
@@ -116,21 +130,29 @@ class LMCacheMPConnector:
             raise NotImplementedError(
                 "LMCache MP currently supports SGLang NHD/MLA 3-D KV tensors only"
             )
-        if not is_mla and kv_tensors[0].shape[1] == 1:
-            # LMCache's SGLang wire-format detector distinguishes fused MLA
-            # from split MHA using the middle dimension. A one-local-head MHA
-            # tensor is byte-compatible with (2, head_dim / 2); register that
-            # zero-copy view so common GQA+TP configurations remain MHA. The
-            # transfer kernel only needs the per-token contiguous byte span.
-            if any(t.shape[1] != 1 or t.shape[2] % 2 for t in kv_tensors):
-                raise NotImplementedError(
-                    "One-head SGLang MHA requires an even per-head dimension "
-                    "for LMCache MP format disambiguation"
+        if any(not tensor.is_contiguous() for tensor in kv_tensors):
+            raise NotImplementedError(
+                "LMCache MP currently requires contiguous SGLang NHD/MLA tensors"
+            )
+
+        # Register every SGLang tensor as an opaque single-plane view.  MHA K
+        # and V live in separate allocations, so a hybrid registration cannot
+        # represent them as one nested [K_layers, V_layers] object without
+        # losing the component boundary.  Flattening only the per-token payload
+        # is a zero-copy view and is byte-for-byte symmetric for store/load.
+        wire_groups: list[LMCacheKVGroup] = []
+        for group in kv_groups:
+            wire_groups.append(
+                LMCacheKVGroup(
+                    name=group.name,
+                    kv_tensors=tuple(
+                        tensor.view(tensor.shape[0], 1, -1)
+                        for tensor in group.kv_tensors
+                    ),
+                    sliding_window_size=group.sliding_window_size,
                 )
-            kv_tensors = [
-                tensor.view(tensor.shape[0], 2, tensor.shape[2] // 2)
-                for tensor in kv_tensors
-            ]
+            )
+        kv_tensors = [tensor for group in wire_groups for tensor in group.kv_tensors]
 
         config = load_engine_config_with_overrides(config_file_path=config_file)
         if not config.mp_host:
@@ -175,6 +197,11 @@ class LMCacheMPConnector:
         self.device = kv_tensors[0].device
         self.instance_id = uuid.uuid4().int & ((1 << 63) - 1)
         self._kv_caches = {f"kv_{i}": tensor for i, tensor in enumerate(kv_tensors)}
+        self._kv_groups = tuple(wire_groups)
+        (
+            self._engine_group_info_specs,
+            self._kernel_group_to_engine_group,
+        ) = self._build_engine_group_info_specs()
         self._context = zmq.Context.instance()
         self._mq_client = MessageQueueClient(self.server_url, self._context)
         self._transfer_ctx: Any = None
@@ -197,6 +224,33 @@ class LMCacheMPConnector:
         self.blocks_in_chunk = self.chunk_size // self.page_size
         self.register_kv_cache()
         self._start_heartbeat()
+
+    def _build_engine_group_info_specs(
+        self,
+    ) -> tuple[list[dict[str, Any]], tuple[int, ...]]:
+        """Build kernel-group metadata while preserving component address spaces."""
+        specs: list[dict[str, Any]] = []
+        tensor_offset = 0
+        for engine_group_id, group in enumerate(self._kv_groups):
+            # LMCache creates one copy-kernel group per physical identity.  The
+            # opaque wire format has NH=1 and a shared page size, so flattened
+            # per-token width and dtype reproduce LMCache's kernel identity.
+            buckets: dict[tuple[Any, ...], list[int]] = {}
+            for local_idx, tensor in enumerate(group.kv_tensors):
+                identity = (tensor.shape[-1], tensor.dtype)
+                buckets.setdefault(identity, []).append(tensor_offset + local_idx)
+            for indices in buckets.values():
+                specs.append(
+                    {
+                        "engine_group_id": engine_group_id,
+                        "layer_indices": tuple(indices),
+                        "tokens_per_block": self.page_size,
+                        "sw_size_tokens": group.sliding_window_size,
+                        "recurrent_state": False,
+                    }
+                )
+            tensor_offset += len(group.kv_tensors)
+        return specs, tuple(spec["engine_group_id"] for spec in specs)
 
     @staticmethod
     def _send_request(mq_client: Any, request_type: Any, payloads: list[Any]):
@@ -240,6 +294,7 @@ class LMCacheMPConnector:
     def register_kv_cache(self) -> None:
         """Export the SGLang GPU tensors to the LMCache MP server once."""
         from lmcache.utils import EngineType
+        from lmcache.v1.multiprocess.group_view import EngineGroupInfo
         from lmcache.v1.multiprocess.transfer_context import create_transfer_context
         from lmcache.v1.platform.base.event_ipc import get_event_ipc_backend
 
@@ -250,6 +305,9 @@ class LMCacheMPConnector:
         self._transfer_ctx = create_transfer_context(
             self._kv_caches, mode="lmcache_driven"
         )
+        engine_group_infos = [
+            EngineGroupInfo(**spec) for spec in self._engine_group_info_specs
+        ]
         try:
             self._transfer_ctx.register(
                 self.instance_id,
@@ -261,7 +319,7 @@ class LMCacheMPConnector:
                 self._mq_timeout,
                 self._send_request,
                 layout_hints={"tokens_per_block": self.page_size},
-                engine_group_infos=(),
+                engine_group_infos=engine_group_infos,
                 engine_type=EngineType.SGLANG,
             )
         except Exception:
@@ -410,7 +468,9 @@ class LMCacheMPConnector:
         operation.locks_held = operation.total_hit_tokens > 0
         return operation.total_hit_tokens
 
-    def _slots_to_blocks(self, slots: torch.Tensor) -> list[int]:
+    def _slots_to_blocks(
+        self, slots: torch.Tensor, *, allow_dummy_page: bool = False
+    ) -> list[int]:
         if slots.numel() == 0:
             return []
         if slots.numel() % self.page_size:
@@ -420,9 +480,51 @@ class LMCacheMPConnector:
         )
         starts = pages[:, 0]
         expected = starts[:, None] + torch.arange(self.page_size, dtype=torch.int64)
-        if torch.any(starts % self.page_size) or not torch.equal(pages, expected):
+        dummy_pages = torch.all(pages == 0, dim=1) if allow_dummy_page else None
+        valid_pages = torch.all(pages == expected, dim=1)
+        if dummy_pages is not None:
+            valid_pages |= dummy_pages
+        if torch.any(starts % self.page_size) or not bool(torch.all(valid_pages)):
             raise ValueError("LMCache slots must be page-aligned contiguous pages")
         return (starts // self.page_size).tolist()
+
+    def _normalize_group_indices(
+        self, device_indices: list[torch.Tensor] | torch.Tensor
+    ) -> list[torch.Tensor]:
+        if isinstance(device_indices, torch.Tensor):
+            device_indices = [device_indices]
+        if len(device_indices) != len(self._kv_groups):
+            raise ValueError(
+                f"Expected {len(self._kv_groups)} LMCache block-id groups, "
+                f"got {len(device_indices)}"
+            )
+        lengths = {int(indices.numel()) for indices in device_indices}
+        if len(lengths) > 1:
+            raise ValueError(
+                "All LMCache engine groups must cover the same token range"
+            )
+        return device_indices
+
+    def _expand_engine_group_block_ids(
+        self, engine_group_block_ids: list[list[int]]
+    ) -> list[list[int]]:
+        """Expand component block IDs to LMCache's physical kernel-group order."""
+        return [
+            list(engine_group_block_ids[engine_group_id])
+            for engine_group_id in self._kernel_group_to_engine_group
+        ]
+
+    def _block_ids_for_transfer(
+        self,
+        device_indices: list[torch.Tensor] | torch.Tensor,
+        *,
+        allow_dummy_page: bool,
+    ) -> list[list[int]]:
+        per_engine_group = [
+            self._slots_to_blocks(indices, allow_dummy_page=allow_dummy_page)
+            for indices in self._normalize_group_indices(device_indices)
+        ]
+        return self._expand_engine_group_block_ids(per_engine_group)
 
     def _free_lookup_locks(
         self, operation: LMCacheLookupOperation, start: int, end: int
@@ -458,18 +560,26 @@ class LMCacheMPConnector:
     def submit_load(
         self,
         operation: LMCacheLookupOperation,
-        device_indices: torch.Tensor,
+        device_indices: list[torch.Tensor] | torch.Tensor,
         *,
         local_hit_tokens: int,
+        owned_device_indices: Optional[torch.Tensor] = None,
     ) -> LMCacheLoadOperation:
         if operation.total_hit_tokens is None or not operation.locks_held:
             raise RuntimeError("LMCache load requires a completed, locked lookup")
         total_hit = operation.total_hit_tokens
         start = local_hit_tokens // self.chunk_size * self.chunk_size
         prefix_pad = local_hit_tokens - start
-        fresh_blocks = self._slots_to_blocks(device_indices)
+        group_indices = self._normalize_group_indices(device_indices)
+        fresh_blocks = [
+            self._slots_to_blocks(indices, allow_dummy_page=True)
+            for indices in group_indices
+        ]
         prefix_pages = prefix_pad // self.page_size
-        block_ids = [0] * prefix_pages + fresh_blocks
+        engine_group_block_ids = [
+            [0] * prefix_pages + blocks for blocks in fresh_blocks
+        ]
+        block_ids = self._expand_engine_group_block_ids(engine_group_block_ids)
         key = self._create_key(
             operation, start=start, end=total_hit, worker_id=self.worker_id
         )
@@ -482,7 +592,7 @@ class LMCacheMPConnector:
                 key,
                 self.instance_id,
                 self._kv_caches,
-                [block_ids],
+                block_ids,
                 event,
                 self.blocks_in_chunk,
                 skip_first_n_tokens=prefix_pad,
@@ -505,7 +615,11 @@ class LMCacheMPConnector:
             start=start,
             end=total_hit,
             local_hit_tokens=local_hit_tokens,
-            device_indices=device_indices,
+            device_indices=(
+                group_indices[0]
+                if owned_device_indices is None
+                else owned_device_indices
+            ),
             future=future,
             lookup=operation,
         )
@@ -534,7 +648,7 @@ class LMCacheMPConnector:
         self,
         request_id: str,
         token_ids: list[int],
-        device_indices: torch.Tensor,
+        device_indices: list[torch.Tensor] | torch.Tensor,
         *,
         cache_salt: str,
     ) -> Optional[LMCacheStoreOperation]:
@@ -550,7 +664,25 @@ class LMCacheMPConnector:
             local_hit_tokens=0,
             cache_salt=cache_salt,
         )
-        blocks = self._slots_to_blocks(device_indices[start:aligned_end])
+        group_indices = self._normalize_group_indices(device_indices)
+        engine_group_blocks = [
+            self._slots_to_blocks(
+                indices[start:aligned_end], allow_dummy_page=True
+            )
+            for indices in group_indices
+        ]
+        # Slot/page zero is SGLang's padding sink.  A zero in a store group
+        # means the SWA page has already been tombstoned, so persisting it
+        # would create a false hit with invalid KV.  Incremental chunk stores
+        # can retry once the requested range consists only of live pages.
+        if any(0 in blocks for blocks in engine_group_blocks):
+            logger.debug(
+                "LMCache store deferred for %s: transfer range contains an "
+                "unmapped component page",
+                request_id,
+            )
+            return None
+        blocks = self._expand_engine_group_block_ids(engine_group_blocks)
         key = self._create_key(
             lookup, start=start, end=aligned_end, worker_id=self.worker_id
         )
@@ -561,7 +693,7 @@ class LMCacheMPConnector:
                 key,
                 self.instance_id,
                 self._kv_caches,
-                [blocks],
+                blocks,
                 event,
                 self.blocks_in_chunk,
             )
