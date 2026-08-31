@@ -65,6 +65,15 @@ class LMCacheKVGroup:
     name: str
     kv_tensors: tuple[torch.Tensor, ...]
     sliding_window_size: int = -1
+    # Logical tokens covered by one engine block id. Attention groups use the
+    # SGLang page size; a recurrent/Mamba group uses its checkpoint grid.
+    tokens_per_block: int = 0
+    # SGLang allocator slots covered by one block id. This is page_size for
+    # attention and 1 for a Mamba checkpoint slot. The connector folds each
+    # complete block into one opaque row before LMCache registration, so this
+    # is intentionally distinct from LMCache's detected physical BS (= 1).
+    slots_per_block: int = 0
+    recurrent_state: bool = False
 
 
 @dataclass
@@ -135,21 +144,61 @@ class LMCacheMPConnector:
                 "LMCache MP currently requires contiguous SGLang NHD/MLA tensors"
             )
 
-        # Register every SGLang tensor as an opaque single-plane view.  MHA K
-        # and V live in separate allocations, so a hybrid registration cannot
-        # represent them as one nested [K_layers, V_layers] object without
-        # losing the component boundary.  Flattening only the per-token payload
-        # is a zero-copy view and is byte-for-byte symmetric for store/load.
-        wire_groups: list[LMCacheKVGroup] = []
+        resolved_groups: list[LMCacheKVGroup] = []
         for group in kv_groups:
+            tokens_per_block = group.tokens_per_block or page_size
+            slots_per_block = group.slots_per_block or page_size
+            if tokens_per_block <= 0 or slots_per_block <= 0:
+                raise ValueError(
+                    f"LMCache group {group.name!r} has invalid block geometry: "
+                    f"{tokens_per_block=}, {slots_per_block=}"
+                )
+            if tokens_per_block % slots_per_block:
+                raise ValueError(
+                    f"LMCache group {group.name!r} tokens_per_block "
+                    f"{tokens_per_block} must be a multiple of slots_per_block "
+                    f"{slots_per_block}"
+                )
+            if any(tensor.shape[0] % slots_per_block for tensor in group.kv_tensors):
+                raise ValueError(
+                    f"LMCache group {group.name!r} tensor rows must be divisible "
+                    f"by slots_per_block={slots_per_block}"
+                )
+            resolved_groups.append(
+                LMCacheKVGroup(
+                    name=group.name,
+                    kv_tensors=group.kv_tensors,
+                    sliding_window_size=group.sliding_window_size,
+                    tokens_per_block=tokens_per_block,
+                    slots_per_block=slots_per_block,
+                    recurrent_state=group.recurrent_state,
+                )
+            )
+
+        # Register every SGLang block as one opaque row. Attention tensors fold
+        # their page_size consecutive token slots into that row; a recurrent
+        # tensor already has one complete state slot per block. This mirrors
+        # vLLM's Mamba page view: LMCache sees a uniform physical BS of 1 while
+        # EngineGroupInfo.tokens_per_block carries the logical token coverage
+        # (page_size/checkpoint grid) independently. All views are zero-copy.
+        #
+        # MHA K and V live in separate allocations, so a hybrid registration
+        # cannot represent them as one nested [K_layers, V_layers] object
+        # without losing the component boundary. Treating every page as opaque
+        # bytes is byte-for-byte symmetric for store/load.
+        wire_groups: list[LMCacheKVGroup] = []
+        for group in resolved_groups:
             wire_groups.append(
                 LMCacheKVGroup(
                     name=group.name,
                     kv_tensors=tuple(
-                        tensor.view(tensor.shape[0], 1, -1)
+                        self._to_wire_block_tensor(tensor, group.slots_per_block)
                         for tensor in group.kv_tensors
                     ),
                     sliding_window_size=group.sliding_window_size,
+                    tokens_per_block=group.tokens_per_block,
+                    slots_per_block=group.slots_per_block,
+                    recurrent_state=group.recurrent_state,
                 )
             )
         kv_tensors = [tensor for group in wire_groups for tensor in group.kv_tensors]
@@ -175,6 +224,13 @@ class LMCacheMPConnector:
                 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
             )
         )
+        if any(group.recurrent_state for group in wire_groups):
+            logger.warning(
+                "LMCache Mamba/recurrent groups require the LMCache MP server "
+                "to be started with --separate-object-groups; otherwise a "
+                "partial-prefix lookup can observe a recurrent state from the "
+                "wrong checkpoint."
+            )
 
         self.model_name = model_name
         self.world_size = int(world_size)
@@ -194,6 +250,8 @@ class LMCacheMPConnector:
         else:
             self._lookup_leader = True
         self.page_size = int(page_size)
+        # Every registered wire row is one complete engine block/page.
+        self._layout_slots_per_block = 1
         self.device = kv_tensors[0].device
         self.instance_id = uuid.uuid4().int & ((1 << 63) - 1)
         self._kv_caches = {f"kv_{i}": tensor for i, tensor in enumerate(kv_tensors)}
@@ -216,14 +274,30 @@ class LMCacheMPConnector:
         self._heartbeat_thread: Optional[threading.Thread] = None
 
         self.chunk_size = self._get_chunk_size()
-        if self.chunk_size <= 0 or self.chunk_size % self.page_size:
+        if self.chunk_size <= 0 or any(
+            self.chunk_size % group.tokens_per_block for group in self._kv_groups
+        ):
             raise ValueError(
                 f"LMCache chunk size {self.chunk_size} must be a positive "
-                f"multiple of SGLang page size {self.page_size}"
+                "multiple of every SGLang group tokens_per_block"
             )
-        self.blocks_in_chunk = self.chunk_size // self.page_size
+        # LMCache-driven MP ignores this compatibility argument; per-group
+        # block counts are derived from EngineGroupInfo.tokens_per_block.
+        self.blocks_in_chunk = self.chunk_size
         self.register_kv_cache()
         self._start_heartbeat()
+
+    @staticmethod
+    def _to_wire_block_tensor(
+        tensor: torch.Tensor, slots_per_block: int
+    ) -> torch.Tensor:
+        """View one complete SGLang block as one opaque LMCache row."""
+        if tensor.shape[0] % slots_per_block:
+            raise ValueError(
+                f"Tensor rows {tensor.shape[0]} are not divisible by "
+                f"slots_per_block={slots_per_block}"
+            )
+        return tensor.view(tensor.shape[0] // slots_per_block, 1, -1)
 
     def _build_engine_group_info_specs(
         self,
@@ -244,9 +318,9 @@ class LMCacheMPConnector:
                     {
                         "engine_group_id": engine_group_id,
                         "layer_indices": tuple(indices),
-                        "tokens_per_block": self.page_size,
+                        "tokens_per_block": group.tokens_per_block,
                         "sw_size_tokens": group.sliding_window_size,
-                        "recurrent_state": False,
+                        "recurrent_state": group.recurrent_state,
                     }
                 )
             tensor_offset += len(group.kv_tensors)
@@ -318,7 +392,9 @@ class LMCacheMPConnector:
                 self._mq_client,
                 self._mq_timeout,
                 self._send_request,
-                layout_hints={"tokens_per_block": self.page_size},
+                # This hint describes the physical tensor shape. Logical
+                # compression is carried independently by EngineGroupInfo.
+                layout_hints={"tokens_per_block": self._layout_slots_per_block},
                 engine_group_infos=engine_group_infos,
                 engine_type=EngineType.SGLANG,
             )
@@ -469,24 +545,31 @@ class LMCacheMPConnector:
         return operation.total_hit_tokens
 
     def _slots_to_blocks(
-        self, slots: torch.Tensor, *, allow_dummy_page: bool = False
+        self,
+        slots: torch.Tensor,
+        *,
+        slots_per_block: Optional[int] = None,
+        allow_dummy_page: bool = False,
     ) -> list[int]:
+        slots_per_block = slots_per_block or self.page_size
         if slots.numel() == 0:
             return []
-        if slots.numel() % self.page_size:
+        if slots.numel() % slots_per_block:
             raise ValueError("LMCache slots must contain complete SGLang pages")
         pages = slots.detach().to(dtype=torch.int64, device="cpu").reshape(
-            -1, self.page_size
+            -1, slots_per_block
         )
         starts = pages[:, 0]
-        expected = starts[:, None] + torch.arange(self.page_size, dtype=torch.int64)
+        expected = starts[:, None] + torch.arange(
+            slots_per_block, dtype=torch.int64
+        )
         dummy_pages = torch.all(pages == 0, dim=1) if allow_dummy_page else None
         valid_pages = torch.all(pages == expected, dim=1)
         if dummy_pages is not None:
             valid_pages |= dummy_pages
-        if torch.any(starts % self.page_size) or not bool(torch.all(valid_pages)):
+        if torch.any(starts % slots_per_block) or not bool(torch.all(valid_pages)):
             raise ValueError("LMCache slots must be page-aligned contiguous pages")
-        return (starts // self.page_size).tolist()
+        return (starts // slots_per_block).tolist()
 
     def _normalize_group_indices(
         self, device_indices: list[torch.Tensor] | torch.Tensor
@@ -498,11 +581,12 @@ class LMCacheMPConnector:
                 f"Expected {len(self._kv_groups)} LMCache block-id groups, "
                 f"got {len(device_indices)}"
             )
-        lengths = {int(indices.numel()) for indices in device_indices}
-        if len(lengths) > 1:
-            raise ValueError(
-                "All LMCache engine groups must cover the same token range"
-            )
+        for group, indices in zip(self._kv_groups, device_indices, strict=True):
+            if indices.numel() % group.slots_per_block:
+                raise ValueError(
+                    f"LMCache group {group.name!r} indices do not contain "
+                    "complete physical blocks"
+                )
         return device_indices
 
     def _expand_engine_group_block_ids(
@@ -521,8 +605,16 @@ class LMCacheMPConnector:
         allow_dummy_page: bool,
     ) -> list[list[int]]:
         per_engine_group = [
-            self._slots_to_blocks(indices, allow_dummy_page=allow_dummy_page)
-            for indices in self._normalize_group_indices(device_indices)
+            self._slots_to_blocks(
+                indices,
+                slots_per_block=group.slots_per_block,
+                allow_dummy_page=allow_dummy_page,
+            )
+            for group, indices in zip(
+                self._kv_groups,
+                self._normalize_group_indices(device_indices),
+                strict=True,
+            )
         ]
         return self._expand_engine_group_block_ids(per_engine_group)
 
@@ -571,13 +663,43 @@ class LMCacheMPConnector:
         start = local_hit_tokens // self.chunk_size * self.chunk_size
         prefix_pad = local_hit_tokens - start
         group_indices = self._normalize_group_indices(device_indices)
+        fresh_tokens = total_hit - local_hit_tokens
+        transfer_tokens = total_hit - start
+        for group, indices in zip(self._kv_groups, group_indices, strict=True):
+            group_covered_tokens = (
+                int(indices.numel())
+                * group.tokens_per_block
+                // group.slots_per_block
+            )
+            expected_tokens = transfer_tokens if group.recurrent_state else fresh_tokens
+            if group_covered_tokens != expected_tokens:
+                raise ValueError(
+                    f"LMCache load group {group.name!r} indices cover "
+                    f"{group_covered_tokens} tokens, expected {expected_tokens}"
+                )
+        if any(
+            prefix_pad % group.tokens_per_block
+            for group in self._kv_groups
+            if not group.recurrent_state
+        ):
+            raise ValueError(
+                "LMCache local hit must align to every group tokens_per_block"
+            )
         fresh_blocks = [
-            self._slots_to_blocks(indices, allow_dummy_page=True)
-            for indices in group_indices
+            self._slots_to_blocks(
+                indices,
+                slots_per_block=group.slots_per_block,
+                allow_dummy_page=True,
+            )
+            for group, indices in zip(self._kv_groups, group_indices, strict=True)
         ]
-        prefix_pages = prefix_pad // self.page_size
         engine_group_block_ids = [
-            [0] * prefix_pages + blocks for blocks in fresh_blocks
+            (
+                blocks
+                if group.recurrent_state
+                else [0] * (prefix_pad // group.tokens_per_block) + blocks
+            )
+            for group, blocks in zip(self._kv_groups, fresh_blocks, strict=True)
         ]
         block_ids = self._expand_engine_group_block_ids(engine_group_block_ids)
         key = self._create_key(
@@ -665,17 +787,41 @@ class LMCacheMPConnector:
             cache_salt=cache_salt,
         )
         group_indices = self._normalize_group_indices(device_indices)
-        engine_group_blocks = [
-            self._slots_to_blocks(
-                indices[start:aligned_end], allow_dummy_page=True
+        for group, indices in zip(self._kv_groups, group_indices, strict=True):
+            group_covered_tokens = (
+                int(indices.numel())
+                * group.tokens_per_block
+                // group.slots_per_block
             )
-            for indices in group_indices
-        ]
-        # Slot/page zero is SGLang's padding sink.  A zero in a store group
-        # means the SWA page has already been tombstoned, so persisting it
-        # would create a false hit with invalid KV.  Incremental chunk stores
-        # can retry once the requested range consists only of live pages.
-        if any(0 in blocks for blocks in engine_group_blocks):
+            if group_covered_tokens < aligned_end:
+                raise ValueError(
+                    f"LMCache store group {group.name!r} indices cover "
+                    f"{group_covered_tokens} tokens, expected at least {aligned_end}"
+                )
+        engine_group_blocks = []
+        for group, indices in zip(self._kv_groups, group_indices, strict=True):
+            start_slot = start * group.slots_per_block // group.tokens_per_block
+            end_slot = (
+                aligned_end * group.slots_per_block // group.tokens_per_block
+            )
+            engine_group_blocks.append(
+                self._slots_to_blocks(
+                    indices[start_slot:end_slot],
+                    slots_per_block=group.slots_per_block,
+                    allow_dummy_page=True,
+                )
+            )
+        # Slot/page zero is SGLang's padding sink. For attention a zero means
+        # the SWA page has already been tombstoned, so defer the store. Mamba is
+        # deliberately sparse: only the final checkpoint is real and LMCache's
+        # recurrent object group skips all-null earlier chunks.
+        if any(
+            0 in blocks
+            for group, blocks in zip(
+                self._kv_groups, engine_group_blocks, strict=True
+            )
+            if not group.recurrent_state
+        ):
             logger.debug(
                 "LMCache store deferred for %s: transfer range contains an "
                 "unmapped component page",

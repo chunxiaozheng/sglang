@@ -52,6 +52,7 @@ class _ExternalFlow:
     load: Optional[LMCacheLoadOperation] = None
     anchor_node: Optional[NodeId] = None
     anchor_lock: Optional[DecLockRefParams] = None
+    mamba_value: Optional[torch.Tensor] = None
     cancelled: bool = False
 
 
@@ -63,7 +64,7 @@ class _PendingStore:
 
 
 class LMCacheUnifiedRadixCache(UnifiedRadixCache):
-    """Unified radix tree with device-direct LMCache MP attention-KV I/O."""
+    """Unified radix tree with device-direct LMCache MP KV/state I/O."""
 
     def __init__(
         self,
@@ -79,11 +80,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache requires FULL as its base component"
             )
-        unsupported = set(components) - {ComponentType.FULL, ComponentType.SWA}
+        unsupported = set(components) - {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
         if unsupported:
             names = ", ".join(sorted(component.name for component in unsupported))
             raise NotImplementedError(
-                "LMCacheUnifiedRadixCache does not yet support non-attention "
+                "LMCacheUnifiedRadixCache does not yet support tree "
                 f"components: {names}"
             )
         if params.pp_size != 1:
@@ -92,6 +97,20 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
 
         super().__init__(params)
+        self._mamba_component = next(
+            (
+                component
+                for component in self._components_tuple
+                if component.component_type is ComponentType.MAMBA
+            ),
+            None,
+        )
+        if self._mamba_component is not None:
+            if self._mamba_component.int8_ckpt_pool is not None:
+                raise NotImplementedError(
+                    "LMCache Mamba hybrid support does not yet support int8 "
+                    "radix checkpoints"
+                )
         kv_groups = self._resolve_registered_groups()
         self._lmcache_component_types = tuple(self.tree_components)
         self.lmcache_connector = LMCacheMPConnector(
@@ -137,6 +156,59 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
         return tuple([*k_buffer, *v_buffer])
 
+    @staticmethod
+    def _resolve_mamba_pool_tensors(mamba_pool) -> tuple[torch.Tensor, ...]:
+        """Expose Mamba state as zero-copy tensors for LMCache registration.
+
+        Keep this connector-specific adaptation local instead of adding an
+        LMCache-facing API to the shared Mamba pool classes.
+        """
+        unified_buffer = getattr(mamba_pool, "_unified_buffer", None)
+        sub_pool_name = getattr(mamba_pool, "_sub_pool_name", None)
+        if unified_buffer is not None and sub_pool_name is not None:
+            if unified_buffer.anchor_bytes(sub_pool_name) != 0:
+                raise NotImplementedError(
+                    "LMCache requires the unified Mamba pool to start at its "
+                    "backing buffer base"
+                )
+            entry_bytes = unified_buffer.mamba_spec(sub_pool_name).entry_bytes()
+            num_slots = mamba_pool._max_size + 1
+            raw = unified_buffer._raw[: num_slots * entry_bytes]
+            return (raw.view(num_slots, 1, entry_bytes),)
+
+        tensors: list[torch.Tensor] = []
+        for (
+            field,
+            state_tensor,
+            slice_axis,
+        ) in mamba_pool._iter_transfer_state_tensors():
+            if slice_axis != 0:
+                raise NotImplementedError(
+                    f"LMCache MP does not support {field} state with slot "
+                    f"slice_axis={slice_axis}"
+                )
+            for layer_idx in range(mamba_pool.num_mamba_layers):
+                layer_tensor = state_tensor[layer_idx]
+                if not layer_tensor.is_contiguous():
+                    raise NotImplementedError(
+                        f"LMCache MP requires contiguous {field} state for "
+                        f"Mamba layer {layer_idx}"
+                    )
+                tensors.append(layer_tensor)
+        return tuple(tensors)
+
+    @staticmethod
+    def _reset_mamba_checkpoint_metadata(mamba_pool, indices: torch.Tensor) -> None:
+        """Reset ReplaySSM cursors that are not persisted by LMCache."""
+        for name in (
+            "replayssm_write_pos",
+            "replayssm_cache_base",
+            "replayssm_is_flush",
+        ):
+            value = getattr(mamba_pool, name, None)
+            if value is not None:
+                value[indices] = 0
+
     def _resolve_registered_groups(self) -> list[LMCacheKVGroup]:
         """Map Unified tree components to LMCache engine KV groups."""
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -153,13 +225,46 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         f"{type(kv_pool).__name__}"
                     )
                 sliding_window_size = self._aligned_swa_window_size()
+                tokens_per_block = self.page_size
+                slots_per_block = self.page_size
+                recurrent_state = False
+                tensors = self._resolve_pool_tensors(component_pool)
+            elif component_type is ComponentType.MAMBA:
+                mamba_pool = self.req_to_token_pool.mamba_pool
+                checkpoint_grid = self._mamba_component.mamba_checkpoint_grid
+                groups.append(
+                    LMCacheKVGroup(
+                        name=component_type.name.lower(),
+                        kv_tensors=tuple(
+                            tensor.view(tensor.shape[0], 1, -1)
+                            for tensor in self._resolve_mamba_pool_tensors(mamba_pool)
+                        ),
+                        # One state slot is a complete recurrent-state page. It
+                        # semantically represents the state after the final
+                        # token of this checkpoint interval; it is not one
+                        # token-sized fragment of an attention page.
+                        sliding_window_size=checkpoint_grid,
+                        tokens_per_block=checkpoint_grid,
+                        slots_per_block=1,
+                        recurrent_state=True,
+                    )
+                )
+                continue
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
+            if component_type is ComponentType.FULL:
+                tokens_per_block = self.page_size
+                slots_per_block = self.page_size
+                recurrent_state = False
+                tensors = self._resolve_pool_tensors(component_pool)
             groups.append(
                 LMCacheKVGroup(
                     name=component_type.name.lower(),
-                    kv_tensors=self._resolve_pool_tensors(component_pool),
+                    kv_tensors=tensors,
                     sliding_window_size=sliding_window_size,
+                    tokens_per_block=tokens_per_block,
+                    slots_per_block=slots_per_block,
+                    recurrent_state=recurrent_state,
                 )
             )
         return groups
@@ -173,7 +278,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def _device_indices_by_group(
-        self, full_indices: torch.Tensor
+        self,
+        full_indices: torch.Tensor,
+        *,
+        mamba_value: Optional[torch.Tensor] = None,
+        mamba_transfer_tokens: Optional[int] = None,
     ) -> list[torch.Tensor]:
         """Translate tree FULL ids into each component's physical address space."""
         allocator = self.token_to_kv_pool_allocator
@@ -183,9 +292,51 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 result.append(allocator.translate_kv_indices_for_transfer(full_indices))
             elif component_type is ComponentType.SWA:
                 result.append(allocator.translate_loc_from_full_to_swa(full_indices))
+            elif component_type is ComponentType.MAMBA:
+                checkpoint_grid = self._mamba_component.mamba_checkpoint_grid
+                logical_tokens = (
+                    len(full_indices)
+                    if mamba_transfer_tokens is None
+                    else mamba_transfer_tokens
+                )
+                if logical_tokens % checkpoint_grid:
+                    raise ValueError(
+                        "LMCache Mamba transfer range must align to checkpoint "
+                        f"grid {checkpoint_grid}, got {logical_tokens} tokens"
+                    )
+                checkpoint_slots = torch.zeros(
+                    logical_tokens // checkpoint_grid,
+                    dtype=torch.int64,
+                    device=full_indices.device,
+                )
+                if mamba_value is not None and checkpoint_slots.numel():
+                    physical = self.req_to_token_pool.translate_mamba_indices(
+                        mamba_value.view(-1)
+                    )
+                    if physical.numel() != 1:
+                        raise ValueError(
+                            "LMCache Mamba transfer expects exactly one state slot"
+                        )
+                    checkpoint_slots[-1] = physical[0]
+                result.append(checkpoint_slots)
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
         return result
+
+    def _allocate_external_mamba_slot(self) -> Optional[torch.Tensor]:
+        if self._mamba_component is None:
+            return None
+        allocator = self.req_to_token_pool.mamba_allocator
+        slot = allocator.alloc(1)
+        if slot is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = allocator.alloc(1)
+        if slot is not None:
+            physical = self.req_to_token_pool.translate_mamba_indices(slot)
+            self._reset_mamba_checkpoint_metadata(
+                self.req_to_token_pool.mamba_pool, physical
+            )
+        return slot
 
     # ------------------------------------------------------------------
     # Lookup + asynchronous retrieve
@@ -315,13 +466,29 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.anchor_lock = self.inc_lock_ref(flow.anchor_node).to_dec_params()
         num_tokens = total_hit - local_hit
         device_indices = self._allocate_external_slots(num_tokens)
+        mamba_value = (
+            self._allocate_external_mamba_slot()
+            if device_indices is not None and self._mamba_component is not None
+            else None
+        )
         allocation_ok = torch.tensor(
-            [int(device_indices is not None)], dtype=torch.int32, device="cpu"
+            [
+                int(
+                    device_indices is not None
+                    and (
+                        self._mamba_component is None or mamba_value is not None
+                    )
+                )
+            ],
+            dtype=torch.int32,
+            device="cpu",
         )
         self._all_reduce(allocation_ok, torch.distributed.ReduceOp.MIN)
         if not allocation_ok.item():
             if device_indices is not None:
                 self.token_to_kv_pool_allocator.free(device_indices)
+            if mamba_value is not None:
+                self.req_to_token_pool.mamba_allocator.free(mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
                 "LMCache retrieve declined for %s: a TP rank cannot allocate "
@@ -331,16 +498,26 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             return False
         assert device_indices is not None
+        flow.mamba_value = mamba_value
 
         try:
+            load_start = local_hit // self.lmcache_connector.chunk_size
+            load_start *= self.lmcache_connector.chunk_size
             flow.load = self.lmcache_connector.submit_load(
                 flow.lookup,
-                self._device_indices_by_group(device_indices),
+                self._device_indices_by_group(
+                    device_indices,
+                    mamba_value=mamba_value,
+                    mamba_transfer_tokens=total_hit - load_start,
+                ),
                 local_hit_tokens=local_hit,
                 owned_device_indices=device_indices,
             )
         except Exception:
             self.token_to_kv_pool_allocator.free(device_indices)
+            if mamba_value is not None:
+                self.req_to_token_pool.mamba_allocator.free(mamba_value)
+                flow.mamba_value = None
             self.dec_lock_ref(flow.anchor_node, flow.anchor_lock)
             flow.anchor_node = None
             flow.anchor_lock = None
@@ -388,6 +565,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def _finish_failed_load(self, flow: _ExternalFlow) -> None:
         assert flow.load is not None
         self.token_to_kv_pool_allocator.free(flow.load.device_indices)
+        if flow.mamba_value is not None:
+            self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+            flow.mamba_value = None
         self._release_flow_anchor(flow)
         rid = flow.lookup.request_id
         self.lmcache_connector.end_lookup(rid)
@@ -412,10 +592,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         if local_hit < total_hit:
             combined = torch.cat([latest.device_indices, suffix])
-            self.insert(
+            insert_result = self.insert(
                 InsertParams(
                     key=flow.key[:total_hit],
                     value=combined,
+                    mamba_value=flow.mamba_value,
                     prev_prefix_len=local_hit,
                     swa_evicted_seqlen=(
                         max(0, total_hit - self._aligned_swa_window_size())
@@ -424,8 +605,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     ),
                 )
             )
-        elif suffix.numel():
-            self.token_to_kv_pool_allocator.free(suffix)
+            if insert_result.mamba_exist and flow.mamba_value is not None:
+                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+        else:
+            if suffix.numel():
+                self.token_to_kv_pool_allocator.free(suffix)
+            if flow.mamba_value is not None:
+                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+        flow.mamba_value = None
 
         self.prefetch_loaded_tokens_by_reqid[rid] = max(total_hit - local_hit, 0)
         self._release_flow_anchor(flow)
@@ -446,6 +633,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
+        aligned_len = (
+            len(key)
+            // self.lmcache_connector.chunk_size
+            * self.lmcache_connector.chunk_size
+        )
+        key = key[:aligned_len]
         if len(key) == 0:
             return
         matched = super().match_prefix(MatchPrefixParams(key=key))
@@ -458,11 +651,28 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             return
         lock_params = self.inc_lock_ref(matched.last_device_node).to_dec_params()
+        mamba_value = (
+            self.tree_core.get_component_device_value(
+                matched.best_match_node, ComponentType.MAMBA
+            )
+            if self._mamba_component is not None
+            else None
+        )
+        if self._mamba_component is not None and mamba_value is None:
+            self.dec_lock_ref(matched.last_device_node, lock_params)
+            logger.debug(
+                "LMCache store skipped for %s: no Mamba checkpoint at token %d",
+                req.rid,
+                len(key),
+            )
+            return
         try:
             operation = self.lmcache_connector.submit_store(
                 req.rid,
                 key.raw_token_ids()[: len(key)],
-                self._device_indices_by_group(matched.device_indices[: len(key)]),
+                self._device_indices_by_group(
+                    matched.device_indices[: len(key)], mamba_value=mamba_value
+                ),
                 cache_salt=self._external_cache_salt(
                     req.cache_salt, req.extra_key
                 ),
@@ -592,6 +802,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         pass
                     connector.complete_load(flow.load, synchronize=False)
                     self.token_to_kv_pool_allocator.free(flow.load.device_indices)
+                    if flow.mamba_value is not None:
+                        self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+                        flow.mamba_value = None
                     self._release_flow_anchor(flow)
                 connector.end_lookup(flow.lookup.request_id)
             for pending in list(getattr(self, "_pending_stores", [])):
