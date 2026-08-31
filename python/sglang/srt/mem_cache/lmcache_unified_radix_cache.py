@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _ExternalFlow:
     key: RadixKey
-    initial_local_hit: int
     lookup: LMCacheLookupOperation
     load: Optional[LMCacheLoadOperation] = None
     anchor_node: Optional[NodeId] = None
@@ -91,11 +90,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 "LMCacheUnifiedRadixCache does not yet support tree "
                 f"components: {names}"
             )
-        if params.pp_size != 1:
-            raise NotImplementedError(
-                "LMCacheUnifiedRadixCache does not support pipeline parallelism"
-            )
-
         super().__init__(params)
         self._mamba_component = next(
             (
@@ -116,9 +110,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
             model_name=model_config.model_path,
-            world_size=tp_size,
-            worker_id=tp_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
             tp_group=params.tp_cache_group,
+            pp_size=params.pp_size,
+            pp_rank=params.pp_rank,
+            pp_group=params.pp_cache_group,
             page_size=self.page_size,
             kv_groups=kv_groups,
         )
@@ -131,6 +128,23 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # prefetch entry point. LMCache does not pass hash-prefix keys.
         self.hicache_storage_pass_prefix_keys = False
         atexit.register(self.shutdown)
+
+    def _lmcache_all_reduce(
+        self, tensor: torch.Tensor, op: torch.distributed.ReduceOp
+    ) -> None:
+        """Reduce across every TP x PP scheduler participating in LMCache.
+
+        UnifiedRadixCache's PP synchronization intentionally lets PP0 decide
+        and broadcasts that result to later stages. LMCache is different:
+        every PP stage owns distinct layer tensors and performs its own IPC
+        transfer, so readiness and failures must include every stage.
+        """
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+        if self.pp_size > 1:
+            if self.pp_group is None:
+                raise RuntimeError("LMCache PP requires a CPU PP process group")
+            torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
 
     @staticmethod
     def _resolve_pool_tensors(kv_pool) -> tuple[torch.Tensor, ...]:
@@ -589,7 +603,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         self._external_flows[req_id] = _ExternalFlow(
             key=key,
-            initial_local_hit=min(len(local_tokens), len(key)),
             lookup=lookup,
         )
 
@@ -642,6 +655,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def _start_external_load(self, flow: _ExternalFlow, total_hit: int) -> bool:
         latest = super().match_prefix(MatchPrefixParams(key=flow.key))
         local_hit = len(latest.device_indices)
+        # PP stages can have different local capacities. Retrieve from the
+        # shortest common L1 boundary so every globally locked LMCache piece
+        # is either consumed or explicitly released by the same token range.
+        common_local_hit = torch.tensor([local_hit], dtype=torch.int64, device="cpu")
+        self._lmcache_all_reduce(common_local_hit, torch.distributed.ReduceOp.MIN)
+        local_hit = int(common_local_hit.item())
         total_hit = min(total_hit, len(flow.key))
         if total_hit <= local_hit:
             self.prefetch_loaded_tokens_by_reqid[flow.lookup.request_id] = 0
@@ -671,7 +690,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             dtype=torch.int32,
             device="cpu",
         )
-        self._all_reduce(allocation_ok, torch.distributed.ReduceOp.MIN)
+        self._lmcache_all_reduce(allocation_ok, torch.distributed.ReduceOp.MIN)
         if not allocation_ok.item():
             if device_indices is not None:
                 self.token_to_kv_pool_allocator.free(device_indices)
@@ -679,7 +698,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
-                "LMCache retrieve declined for %s: a TP rank cannot allocate "
+                "LMCache retrieve declined for %s: a parallel rank cannot allocate "
                 "%d GPU slots",
                 flow.lookup.request_id,
                 num_tokens,
@@ -726,9 +745,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             total_hit = self.lmcache_connector.poll_lookup(flow.lookup)
             if total_hit is None:
                 return False
-            if total_hit <= flow.initial_local_hit or not self._start_external_load(
-                flow, total_hit
-            ):
+            if not self._start_external_load(flow, total_hit):
                 self.lmcache_connector.end_lookup(req_id)
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.setdefault(req_id, 0)
@@ -830,7 +847,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if len(key) == 0:
             return
         matched = super().match_prefix(MatchPrefixParams(key=key))
-        if len(matched.device_indices) < len(key):
+        prefix_is_resident = torch.tensor(
+            [int(len(matched.device_indices) >= len(key))],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._lmcache_all_reduce(
+            prefix_is_resident, torch.distributed.ReduceOp.MIN
+        )
+        if not prefix_is_resident.item():
             logger.warning(
                 "LMCache store skipped for %s: radix prefix has %d/%d tokens",
                 req.rid,
@@ -846,7 +871,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if self._mamba_component is not None
             else None
         )
-        if self._mamba_component is not None and mamba_value is None:
+        mamba_is_resident = torch.tensor(
+            [int(self._mamba_component is None or mamba_value is not None)],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._lmcache_all_reduce(mamba_is_resident, torch.distributed.ReduceOp.MIN)
+        if not mamba_is_resident.item():
             self.dec_lock_ref(matched.last_device_node, lock_params)
             logger.debug(
                 "LMCache store skipped for %s: no Mamba checkpoint at token %d",
@@ -919,7 +950,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 break
             count += 1
         tensor = torch.tensor([count], dtype=torch.int64, device="cpu")
-        self._all_reduce(tensor, torch.distributed.ReduceOp.MIN)
+        self._lmcache_all_reduce(tensor, torch.distributed.ReduceOp.MIN)
         return int(tensor.item())
 
     def check_hicache_events(self) -> None:
