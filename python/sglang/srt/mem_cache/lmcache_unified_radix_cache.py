@@ -18,19 +18,19 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from lmcache.integration.sglang.unified_lmcache_mp_connector import (
+    LMCacheKVGroup,
+    LMCacheLoadOperation,
+    LMCacheLookupOperation,
+    LMCacheStoreOperation,
+    UnifiedLMCacheMPConnector,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
-)
-from sglang.srt.mem_cache.connectors.lmcache import (
-    LMCacheKVGroup,
-    LMCacheLoadOperation,
-    LMCacheLookupOperation,
-    LMCacheMPConnector,
-    LMCacheStoreOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -113,7 +113,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 )
         kv_groups = self._resolve_registered_groups()
         self._lmcache_component_types = tuple(self.tree_components)
-        self.lmcache_connector = LMCacheMPConnector(
+        self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
             model_name=model_config.model_path,
             world_size=tp_size,

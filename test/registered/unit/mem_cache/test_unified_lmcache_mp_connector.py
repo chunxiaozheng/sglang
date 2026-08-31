@@ -12,11 +12,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.connectors.lmcache.mp_connector import (
+from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     LMCacheKVGroup,
-    LMCacheLookupOperation,
     LMCacheLoadOperation,
-    LMCacheMPConnector,
+    LMCacheLookupOperation,
+    UnifiedLMCacheMPConnector,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
@@ -70,9 +70,9 @@ class _Connector:
         return object()
 
 
-class TestLMCacheMPConnector(unittest.TestCase):
+class TestUnifiedLMCacheMPConnector(unittest.TestCase):
     def setUp(self):
-        self.connector = object.__new__(LMCacheMPConnector)
+        self.connector = object.__new__(UnifiedLMCacheMPConnector)
         self.connector.page_size = 4
 
     def test_slots_to_blocks_accepts_noncontiguous_pages(self):
@@ -126,7 +126,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(wire.data_ptr(), tensor.data_ptr())
 
     def test_group_info_specs_preserve_component_address_spaces(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector.page_size = 4
         connector._kv_groups = (
             LMCacheKVGroup(
@@ -159,7 +159,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
 
     def test_group_info_specs_mark_mamba_as_recurrent_one_block_window(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector._kv_groups = (
             LMCacheKVGroup(
                 "mamba",
@@ -179,7 +179,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(specs[0]["recurrent_state"])
 
     def test_group_info_specs_keep_dsa_sidecar_in_full_address_space(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector._kv_groups = (
             LMCacheKVGroup(
                 "full",
@@ -200,7 +200,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([spec["engine_group_id"] for spec in specs], [0, 0])
 
     def test_submit_store_passes_list_of_block_ids_per_group(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -235,7 +235,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_store_defers_unmapped_swa_page(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector.page_size = 4
         connector.chunk_size = 8
         connector._kv_groups = (
@@ -260,7 +260,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertNotIn("request", connector._store_submitted_tokens)
 
     def test_submit_store_accepts_dummy_mamba_blocks(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
@@ -299,7 +299,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_load_uses_compressed_mamba_block_ids(self):
-        connector = object.__new__(LMCacheMPConnector)
+        connector = object.__new__(UnifiedLMCacheMPConnector)
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
