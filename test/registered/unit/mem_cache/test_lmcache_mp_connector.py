@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.connectors.lmcache.mp_connector import (
     LMCacheLoadOperation,
     LMCacheMPConnector,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
     LMCacheUnifiedRadixCache,
 )
@@ -446,6 +447,74 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(full.tensor_rows_per_block, (4, 1))
         self.assertEqual(full.tokens_per_block, 4)
         self.assertEqual(full.slots_per_block, 4)
+
+    def test_resolve_registered_groups_maps_deepseek_v4_sidecars(self):
+        page_count = 3
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.c4_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.empty(page_count, 37440, dtype=torch.uint8)]
+        )
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[
+                torch.empty(page_count, 8448, dtype=torch.uint8)
+            ]
+        )
+        pool.c128_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.empty(page_count, 1728, dtype=torch.uint8)]
+        )
+        pool.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.empty(page_count, 149760, dtype=torch.uint8)]
+        )
+
+        def state_pool(ratio, rows, width):
+            return SimpleNamespace(
+                ratio=ratio,
+                ring_size=8 if ratio == 4 else 128,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.empty(rows, width, dtype=torch.float32)
+                ),
+            )
+
+        pool.compress_state_pools = [
+            state_pool(4, page_count * 8, 2048),
+            state_pool(128, page_count * 128, 1024),
+        ]
+        pool.indexer_compress_state_pools = [
+            state_pool(4, page_count * 8, 512),
+            None,
+        ]
+
+        class _Allocator:
+            @staticmethod
+            def get_kvcache():
+                return pool
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache.tree_components = (ComponentType.FULL, ComponentType.SWA)
+        cache._sliding_window_size = 128
+        cache.page_size = 256
+
+        groups = cache._resolve_registered_groups()
+
+        self.assertEqual([group.name for group in groups], ["full", "swa"])
+        self.assertEqual([len(group.kv_tensors) for group in groups], [3, 3])
+        self.assertEqual(groups[0].tensor_rows_per_block, (1, 1, 1))
+        self.assertEqual(groups[1].tensor_rows_per_block, (1, 1, 1))
+        self.assertEqual(groups[0].tokens_per_block, 256)
+        self.assertEqual(groups[1].sliding_window_size, 256)
+        self.assertEqual(
+            [tuple(tensor.shape) for tensor in groups[1].kv_tensors[1:]],
+            [(page_count, 8 * 2048 * 4), (page_count, 8 * 512 * 4)],
+        )
+
+    def test_deepseek_v4_rejects_unified_kv_layout(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = True
+
+        with self.assertRaisesRegex(NotImplementedError, "unified_kv_triton"):
+            LMCacheUnifiedRadixCache._resolve_dsv4_full_page_tensors(pool)
 
     def test_resolve_registered_groups_maps_mamba_state_pool(self):
         class _Pool:

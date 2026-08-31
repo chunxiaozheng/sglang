@@ -75,7 +75,8 @@ class LMCacheKVGroup:
     slots_per_block: int = 0
     # Number of source tensor rows making up one block, one value per tensor.
     # Usually this equals slots_per_block. Page-native sidecars such as the DSA
-    # indexer already store one complete page in each row and therefore use 1.
+    # indexer and DeepSeek V4 compressed/state pools already store one complete
+    # logical page in each row and therefore use 1.
     tensor_rows_per_block: tuple[int, ...] = ()
     recurrent_state: bool = False
 
