@@ -177,6 +177,27 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(specs[0]["sw_size_tokens"], 256)
         self.assertTrue(specs[0]["recurrent_state"])
 
+    def test_group_info_specs_keep_dsa_sidecar_in_full_address_space(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector._kv_groups = (
+            LMCacheKVGroup(
+                "full",
+                (
+                    torch.empty(3, 1, 64, dtype=torch.bfloat16),
+                    torch.empty(3, 1, 528, dtype=torch.uint8),
+                ),
+                tokens_per_block=4,
+                slots_per_block=4,
+                tensor_rows_per_block=(1, 1),
+            ),
+        )
+
+        specs, kernel_to_engine = connector._build_engine_group_info_specs()
+
+        self.assertEqual(kernel_to_engine, (0, 0))
+        self.assertEqual([spec["layer_indices"] for spec in specs], [(0,), (1,)])
+        self.assertEqual([spec["engine_group_id"] for spec in specs], [0, 0])
+
     def test_submit_store_passes_list_of_block_ids_per_group(self):
         connector = object.__new__(LMCacheMPConnector)
         connector.page_size = 4
@@ -396,6 +417,35 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([group.name for group in groups], ["full", "swa"])
         self.assertEqual([len(group.kv_tensors) for group in groups], [2, 2])
         self.assertEqual([group.sliding_window_size for group in groups], [-1, 8])
+
+    def test_resolve_registered_groups_adds_dsa_indexer_as_full_sidecar(self):
+        class _DSAPool:
+            use_dsa = True
+            kv_buffer = [torch.empty(12, 1, 8)]
+            index_k_with_scale_buffer = [
+                torch.empty(3, 4 * 132, dtype=torch.uint8),
+                torch.empty(0, 4 * 132, dtype=torch.uint8),
+            ]
+
+        class _Allocator:
+            @staticmethod
+            def get_kvcache():
+                return _DSAPool()
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache.tree_components = (ComponentType.FULL,)
+        cache.page_size = 4
+
+        groups = cache._resolve_registered_groups()
+
+        self.assertEqual(len(groups), 1)
+        full = groups[0]
+        self.assertEqual(full.name, "full")
+        self.assertEqual(len(full.kv_tensors), 2)
+        self.assertEqual(full.tensor_rows_per_block, (4, 1))
+        self.assertEqual(full.tokens_per_block, 4)
+        self.assertEqual(full.slots_per_block, 4)
 
     def test_resolve_registered_groups_maps_mamba_state_pool(self):
         class _Pool:
