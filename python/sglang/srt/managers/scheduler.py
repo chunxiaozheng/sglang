@@ -481,12 +481,13 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
-        self.enable_lmcache = get_memory().enable_lmcache
+        self.enable_unified_lmcache = get_memory().enable_unified_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
-        # Both HiCache L3 and LMCache MP use the scheduler's asynchronous
+        # Both HiCache L3 and Unified LMCache use the scheduler's asynchronous
         # prefetch staging loop. The selected tree cache owns the concrete I/O.
         self.enable_hicache_storage = (
-            get_memory().hicache_storage_backend is not None or self.enable_lmcache
+            get_memory().hicache_storage_backend is not None
+            or self.enable_unified_lmcache
         )
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -3626,7 +3627,7 @@ class Scheduler(
 
         if (
             self.enable_hierarchical_cache
-            or self.enable_lmcache
+            or self.enable_unified_lmcache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
         ):
@@ -4577,10 +4578,10 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_lmcache:
+        if self.enable_unified_lmcache:
             if_success = self.tree_cache.clear_storage_backend()
             if if_success:
-                logger.info("LMCache cleared successfully!")
+                logger.info("Unified LMCache cleared successfully!")
         elif self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
