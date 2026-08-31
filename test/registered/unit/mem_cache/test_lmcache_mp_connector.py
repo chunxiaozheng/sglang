@@ -39,9 +39,14 @@ class _Future:
 class _TransferContext:
     def __init__(self):
         self.store_args = None
+        self.retrieve_args = None
 
     def submit_store(self, *args):
         self.store_args = args
+        return _Future(True)
+
+    def submit_retrieve(self, *args, **kwargs):
+        self.retrieve_args = (args, kwargs)
         return _Future(True)
 
 
@@ -88,7 +93,10 @@ class TestLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_component_block_ids_expand_to_kernel_groups(self):
-        self.connector._kv_groups = (object(), object())
+        self.connector._kv_groups = (
+            LMCacheKVGroup("full", (), tokens_per_block=4, slots_per_block=4),
+            LMCacheKVGroup("swa", (), tokens_per_block=4, slots_per_block=4),
+        )
         self.connector._kernel_group_to_engine_group = (0, 1, 1)
         block_ids = self.connector._block_ids_for_transfer(
             [
@@ -98,6 +106,23 @@ class TestLMCacheMPConnector(unittest.TestCase):
             allow_dummy_page=False,
         )
         self.assertEqual(block_ids, [[1, 3], [2, 4], [2, 4]])
+
+    def test_wire_view_folds_attention_page_into_one_opaque_row(self):
+        tensor = torch.arange(4 * 2 * 3).reshape(4, 2, 3)
+
+        wire = self.connector._to_wire_block_tensor(tensor, slots_per_block=4)
+
+        self.assertEqual(tuple(wire.shape), (1, 1, 24))
+        self.assertEqual(wire.data_ptr(), tensor.data_ptr())
+        self.assertTrue(torch.equal(wire.reshape(-1), tensor.reshape(-1)))
+
+    def test_wire_view_keeps_one_mamba_state_slot_per_block(self):
+        tensor = torch.arange(5 * 2 * 3).reshape(5, 2, 3)
+
+        wire = self.connector._to_wire_block_tensor(tensor, slots_per_block=1)
+
+        self.assertEqual(tuple(wire.shape), (5, 1, 6))
+        self.assertEqual(wire.data_ptr(), tensor.data_ptr())
 
     def test_group_info_specs_preserve_component_address_spaces(self):
         connector = object.__new__(LMCacheMPConnector)
@@ -109,6 +134,8 @@ class TestLMCacheMPConnector(unittest.TestCase):
                     torch.empty(20, 1, 8),
                     torch.empty(20, 1, 8),
                 ),
+                tokens_per_block=4,
+                slots_per_block=4,
             ),
             LMCacheKVGroup(
                 "swa",
@@ -117,6 +144,8 @@ class TestLMCacheMPConnector(unittest.TestCase):
                     torch.empty(12, 1, 16),
                 ),
                 sliding_window_size=8,
+                tokens_per_block=4,
+                slots_per_block=4,
             ),
         )
 
@@ -128,6 +157,26 @@ class TestLMCacheMPConnector(unittest.TestCase):
         )
         self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
 
+    def test_group_info_specs_mark_mamba_as_recurrent_one_block_window(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector._kv_groups = (
+            LMCacheKVGroup(
+                "mamba",
+                (torch.empty(12, 1, 32),),
+                sliding_window_size=256,
+                tokens_per_block=256,
+                slots_per_block=1,
+                recurrent_state=True,
+            ),
+        )
+
+        specs, kernel_to_engine = connector._build_engine_group_info_specs()
+
+        self.assertEqual(kernel_to_engine, (0,))
+        self.assertEqual(specs[0]["tokens_per_block"], 256)
+        self.assertEqual(specs[0]["sw_size_tokens"], 256)
+        self.assertTrue(specs[0]["recurrent_state"])
+
     def test_submit_store_passes_list_of_block_ids_per_group(self):
         connector = object.__new__(LMCacheMPConnector)
         connector.page_size = 4
@@ -135,7 +184,10 @@ class TestLMCacheMPConnector(unittest.TestCase):
         connector.blocks_in_chunk = 2
         connector.worker_id = 0
         connector.instance_id = 1
-        connector._kv_groups = (object(), object())
+        connector._kv_groups = (
+            LMCacheKVGroup("full", (), tokens_per_block=4, slots_per_block=4),
+            LMCacheKVGroup("swa", (), tokens_per_block=4, slots_per_block=4),
+        )
         connector._kernel_group_to_engine_group = (0, 1)
         connector._store_submitted_tokens = {}
         connector._active_sessions = set()
@@ -164,7 +216,10 @@ class TestLMCacheMPConnector(unittest.TestCase):
         connector = object.__new__(LMCacheMPConnector)
         connector.page_size = 4
         connector.chunk_size = 8
-        connector._kv_groups = (object(), object())
+        connector._kv_groups = (
+            LMCacheKVGroup("full", (), tokens_per_block=4, slots_per_block=4),
+            LMCacheKVGroup("swa", (), tokens_per_block=4, slots_per_block=4),
+        )
         connector._kernel_group_to_engine_group = (0, 1)
         connector._store_submitted_tokens = {}
         connector._active_sessions = set()
@@ -181,6 +236,90 @@ class TestLMCacheMPConnector(unittest.TestCase):
 
         self.assertIsNone(operation)
         self.assertNotIn("request", connector._store_submitted_tokens)
+
+    def test_submit_store_accepts_dummy_mamba_blocks(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector.page_size = 1
+        connector.chunk_size = 8
+        connector.blocks_in_chunk = 8
+        connector.worker_id = 0
+        connector.instance_id = 1
+        connector._kv_groups = (
+            LMCacheKVGroup("full", (), tokens_per_block=1, slots_per_block=1),
+            LMCacheKVGroup(
+                "mamba",
+                (),
+                sliding_window_size=4,
+                tokens_per_block=4,
+                slots_per_block=1,
+                recurrent_state=True,
+            ),
+        )
+        connector._kernel_group_to_engine_group = (0, 1)
+        connector._store_submitted_tokens = {}
+        connector._active_sessions = set()
+        connector._kv_caches = {}
+        connector._transfer_ctx = _TransferContext()
+        connector._new_event = lambda: object()
+        connector._create_key = lambda *args, **kwargs: object()
+
+        operation = connector.submit_store(
+            "request",
+            list(range(8)),
+            [torch.arange(1, 9), torch.tensor([0, 7])],
+            cache_salt="",
+        )
+
+        self.assertIsNotNone(operation)
+        self.assertEqual(
+            connector._transfer_ctx.store_args[4],
+            [list(range(1, 9)), [0, 7]],
+        )
+
+    def test_submit_load_uses_compressed_mamba_block_ids(self):
+        connector = object.__new__(LMCacheMPConnector)
+        connector.page_size = 1
+        connector.chunk_size = 8
+        connector.blocks_in_chunk = 8
+        connector.worker_id = 0
+        connector.instance_id = 1
+        connector._kv_groups = (
+            LMCacheKVGroup("full", (), tokens_per_block=1, slots_per_block=1),
+            LMCacheKVGroup(
+                "mamba",
+                (),
+                sliding_window_size=4,
+                tokens_per_block=4,
+                slots_per_block=1,
+                recurrent_state=True,
+            ),
+        )
+        connector._kernel_group_to_engine_group = (0, 1)
+        connector._kv_caches = {}
+        connector._transfer_ctx = _TransferContext()
+        connector._new_event = lambda: object()
+        connector._create_key = lambda *args, **kwargs: object()
+        connector._free_lookup_locks = lambda *args, **kwargs: None
+        lookup = LMCacheLookupOperation(
+            request_id="request",
+            token_ids=list(range(8)),
+            local_hit_tokens=3,
+            cache_salt="",
+            total_hit_tokens=8,
+            locks_held=True,
+        )
+
+        operation = connector.submit_load(
+            lookup,
+            [torch.arange(4, 9), torch.tensor([0, 7])],
+            local_hit_tokens=3,
+        )
+
+        args, kwargs = connector._transfer_ctx.retrieve_args
+        self.assertEqual(args[4], [[0, 0, 0, 4, 5, 6, 7, 8], [0, 7]])
+        self.assertEqual(kwargs["skip_first_n_tokens"], 3)
+        self.assertEqual(operation.start, 0)
+        self.assertEqual(operation.end, 8)
 
     def test_completed_operation_does_not_requery_future(self):
         operation = object.__new__(LMCacheLoadOperation)
@@ -215,7 +354,7 @@ class TestLMCacheMPConnector(unittest.TestCase):
         cache._external_flows = {}
         cache.tree_core = _TreeCore()
         cache.lmcache_connector = _Connector()
-        cache.page_size = 1
+        cache.page_size = 4
 
         cache.prefetch_from_storage(
             "request",
@@ -258,6 +397,51 @@ class TestLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([len(group.kv_tensors) for group in groups], [2, 2])
         self.assertEqual([group.sliding_window_size for group in groups], [-1, 8])
 
+    def test_resolve_registered_groups_maps_mamba_state_pool(self):
+        class _Pool:
+            kv_cache_layout = "nhd"
+            k_buffer = [torch.empty(12, 2, 8)]
+            v_buffer = [torch.empty(12, 2, 8)]
+
+        class _Allocator:
+            @staticmethod
+            def get_kvcache():
+                return _Pool()
+
+        class _MambaPool:
+            num_mamba_layers = 1
+
+            @staticmethod
+            def _iter_transfer_state_tensors():
+                yield "conv", torch.empty(1, 9, 2, 3), 0
+                yield "temporal", torch.empty(1, 9, 4), 0
+
+        class _ReqPool:
+            mamba_pool = _MambaPool()
+
+        class _MambaComponent:
+            mamba_checkpoint_grid = 4
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache.req_to_token_pool = _ReqPool()
+        cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        cache._mamba_component = _MambaComponent()
+        cache.page_size = 4
+
+        groups = cache._resolve_registered_groups()
+
+        self.assertEqual([group.name for group in groups], ["full", "mamba"])
+        mamba = groups[1]
+        self.assertEqual(mamba.tokens_per_block, 4)
+        self.assertEqual(mamba.slots_per_block, 1)
+        self.assertEqual(mamba.sliding_window_size, 4)
+        self.assertTrue(mamba.recurrent_state)
+        self.assertEqual(
+            [tuple(t.shape) for t in mamba.kv_tensors],
+            [(9, 1, 6), (9, 1, 4)],
+        )
+
     def test_device_indices_are_translated_per_component(self):
         class _Allocator:
             @staticmethod
@@ -276,6 +460,36 @@ class TestLMCacheMPConnector(unittest.TestCase):
 
         self.assertTrue(torch.equal(groups[0], torch.tensor([104, 105])))
         self.assertTrue(torch.equal(groups[1], torch.tensor([204, 205])))
+
+    def test_device_indices_compress_mamba_to_checkpoint_blocks(self):
+        class _Allocator:
+            @staticmethod
+            def translate_kv_indices_for_transfer(indices):
+                return indices
+
+        class _ReqPool:
+            @staticmethod
+            def translate_mamba_indices(indices):
+                return indices + 10
+
+        class _MambaComponent:
+            mamba_checkpoint_grid = 4
+
+        cache = object.__new__(LMCacheUnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = _Allocator()
+        cache.req_to_token_pool = _ReqPool()
+        cache._mamba_component = _MambaComponent()
+        cache._lmcache_component_types = (
+            ComponentType.FULL,
+            ComponentType.MAMBA,
+        )
+
+        groups = cache._device_indices_by_group(
+            torch.arange(1, 9), mamba_value=torch.tensor([7])
+        )
+
+        self.assertTrue(torch.equal(groups[0], torch.arange(1, 9)))
+        self.assertTrue(torch.equal(groups[1], torch.tensor([0, 17])))
 
     def test_external_swa_allocation_only_allocates_window_tail(self):
         class _SubAllocator:
