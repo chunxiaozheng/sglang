@@ -1003,6 +1003,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return -1
 
     def supports_retraction_backup(self) -> bool:
+        # TODO(chunxiaozheng): implement retraction backup
         return False
 
     def clear_storage_backend(self) -> bool:
