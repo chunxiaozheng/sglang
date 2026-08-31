@@ -460,6 +460,24 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ),
         )
 
+    def test_lmcache_supports_dsa_as_full_sidecar(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_dsa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.FULL,),
+        )
+
     def test_lmcache_rejects_pure_swa(self):
         ctx = _make_ctx(
             self,

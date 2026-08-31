@@ -134,15 +134,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     @staticmethod
     def _resolve_pool_tensors(kv_pool) -> tuple[torch.Tensor, ...]:
-        if getattr(kv_pool, "use_dsa", False):
-            raise NotImplementedError(
-                "LMCacheUnifiedRadixCache does not yet register DSA indexer pools"
-            )
         kv_buffer = getattr(kv_pool, "kv_buffer", None)
         if kv_buffer is not None:
             if not kv_buffer:
                 raise NotImplementedError("LMCache cannot register an empty MLA pool")
-            return tuple(kv_buffer)
+            tensors = tuple(
+                tensor
+                for tensor in kv_buffer
+                if tensor.numel() > 0 or not getattr(kv_pool, "use_dsa", False)
+            )
+            if not tensors:
+                raise NotImplementedError("DSA pool has no locally owned KV buffers")
+            return tensors
 
         k_buffer = getattr(kv_pool, "k_buffer", None)
         v_buffer = getattr(kv_pool, "v_buffer", None)
@@ -155,6 +158,31 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 "LMCacheUnifiedRadixCache currently supports NHD MHA pools only"
             )
         return tuple([*k_buffer, *v_buffer])
+
+    @staticmethod
+    def _resolve_dsa_indexer_tensors(kv_pool) -> tuple[torch.Tensor, ...]:
+        """Return non-empty page-native DSA indexer buffers.
+
+        DSA indexers are FULL-KV sidecars: their block IDs come from the FULL
+        page allocator, but each source row already contains a whole page's
+        quantized values and scales.
+        """
+        if not getattr(kv_pool, "use_dsa", False):
+            return ()
+        buffers = getattr(kv_pool, "index_k_with_scale_buffer", None)
+        if buffers is None:
+            raise NotImplementedError(
+                f"DSA pool {type(kv_pool).__name__} has no indexer buffers"
+            )
+        tensors = tuple(tensor for tensor in buffers if tensor.numel() > 0)
+        if not tensors:
+            raise NotImplementedError("DSA pool has no locally owned indexer buffers")
+        if any(tensor.dim() != 2 for tensor in tensors):
+            shapes = [tuple(tensor.shape) for tensor in tensors]
+            raise NotImplementedError(
+                f"LMCache MP expects page-native 2-D DSA indexer buffers, got {shapes}"
+            )
+        return tensors
 
     @staticmethod
     def _resolve_mamba_pool_tensors(mamba_pool) -> tuple[torch.Tensor, ...]:
@@ -257,6 +285,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 slots_per_block = self.page_size
                 recurrent_state = False
                 tensors = self._resolve_pool_tensors(component_pool)
+                tensor_rows_per_block = (self.page_size,) * len(tensors)
+                dsa_tensors = self._resolve_dsa_indexer_tensors(component_pool)
+                if dsa_tensors:
+                    tensors = (*tensors, *dsa_tensors)
+                    tensor_rows_per_block += (1,) * len(dsa_tensors)
+            else:
+                tensor_rows_per_block = (self.page_size,) * len(tensors)
             groups.append(
                 LMCacheKVGroup(
                     name=component_type.name.lower(),
@@ -264,6 +299,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     sliding_window_size=sliding_window_size,
                     tokens_per_block=tokens_per_block,
                     slots_per_block=slots_per_block,
+                    tensor_rows_per_block=tensor_rows_per_block,
                     recurrent_state=recurrent_state,
                 )
             )

@@ -73,6 +73,10 @@ class LMCacheKVGroup:
     # complete block into one opaque row before LMCache registration, so this
     # is intentionally distinct from LMCache's detected physical BS (= 1).
     slots_per_block: int = 0
+    # Number of source tensor rows making up one block, one value per tensor.
+    # Usually this equals slots_per_block. Page-native sidecars such as the DSA
+    # indexer already store one complete page in each row and therefore use 1.
+    tensor_rows_per_block: tuple[int, ...] = ()
     recurrent_state: bool = False
 
 
@@ -135,9 +139,9 @@ class LMCacheMPConnector:
             raise NotImplementedError("LMCache MP currently requires CUDA KV tensors")
         if any(t.device != kv_tensors[0].device for t in kv_tensors):
             raise ValueError("All LMCache-registered KV tensors must share one device")
-        if any(t.dim() != 3 for t in kv_tensors):
+        if any(t.dim() < 2 for t in kv_tensors):
             raise NotImplementedError(
-                "LMCache MP currently supports SGLang NHD/MLA 3-D KV tensors only"
+                "LMCache MP requires tensors with a leading block/slot axis"
             )
         if any(not tensor.is_contiguous() for tensor in kv_tensors):
             raise NotImplementedError(
@@ -159,11 +163,24 @@ class LMCacheMPConnector:
                     f"{tokens_per_block} must be a multiple of slots_per_block "
                     f"{slots_per_block}"
                 )
-            if any(tensor.shape[0] % slots_per_block for tensor in group.kv_tensors):
+            tensor_rows_per_block = group.tensor_rows_per_block or (
+                slots_per_block,
+            ) * len(group.kv_tensors)
+            if len(tensor_rows_per_block) != len(group.kv_tensors):
                 raise ValueError(
-                    f"LMCache group {group.name!r} tensor rows must be divisible "
-                    f"by slots_per_block={slots_per_block}"
+                    f"LMCache group {group.name!r} has "
+                    f"{len(group.kv_tensors)} tensors but "
+                    f"{len(tensor_rows_per_block)} tensor row geometries"
                 )
+            for tensor, rows_per_block in zip(
+                group.kv_tensors, tensor_rows_per_block, strict=True
+            ):
+                if rows_per_block <= 0 or tensor.shape[0] % rows_per_block:
+                    raise ValueError(
+                        f"LMCache group {group.name!r} tensor rows "
+                        f"{tensor.shape[0]} are not divisible by "
+                        f"tensor_rows_per_block={rows_per_block}"
+                    )
             resolved_groups.append(
                 LMCacheKVGroup(
                     name=group.name,
@@ -171,6 +188,7 @@ class LMCacheMPConnector:
                     sliding_window_size=group.sliding_window_size,
                     tokens_per_block=tokens_per_block,
                     slots_per_block=slots_per_block,
+                    tensor_rows_per_block=tuple(tensor_rows_per_block),
                     recurrent_state=group.recurrent_state,
                 )
             )
@@ -188,16 +206,28 @@ class LMCacheMPConnector:
         # bytes is byte-for-byte symmetric for store/load.
         wire_groups: list[LMCacheKVGroup] = []
         for group in resolved_groups:
+            wire_tensors = tuple(
+                self._to_wire_block_tensor(tensor, rows_per_block)
+                for tensor, rows_per_block in zip(
+                    group.kv_tensors,
+                    group.tensor_rows_per_block,
+                    strict=True,
+                )
+            )
+            wire_block_counts = {tensor.shape[0] for tensor in wire_tensors}
+            if len(wire_block_counts) != 1:
+                raise ValueError(
+                    f"LMCache group {group.name!r} tensors expose different "
+                    f"block counts: {sorted(wire_block_counts)}"
+                )
             wire_groups.append(
                 LMCacheKVGroup(
                     name=group.name,
-                    kv_tensors=tuple(
-                        self._to_wire_block_tensor(tensor, group.slots_per_block)
-                        for tensor in group.kv_tensors
-                    ),
+                    kv_tensors=wire_tensors,
                     sliding_window_size=group.sliding_window_size,
                     tokens_per_block=group.tokens_per_block,
                     slots_per_block=group.slots_per_block,
+                    tensor_rows_per_block=(1,) * len(group.kv_tensors),
                     recurrent_state=group.recurrent_state,
                 )
             )

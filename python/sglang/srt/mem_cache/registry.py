@@ -120,11 +120,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "LMCacheUnifiedRadixCache currently supports colocated "
                 "prefill/decode scheduling only"
             )
-        if ctx.is_dsa:
-            raise NotImplementedError(
-                "LMCacheUnifiedRadixCache does not yet support DSA sidecar "
-                "components"
-            )
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache does not yet support pure-SWA models"
