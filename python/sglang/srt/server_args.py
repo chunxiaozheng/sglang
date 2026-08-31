@@ -3134,7 +3134,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     enable_lmcache: A[
         bool,
-        "Using LMCache as an alternative hierarchical cache solution",
+        "Use the legacy LMCRadixCache integration",
+        NS("memory"),
+    ] = False
+    enable_unified_lmcache: A[
+        bool,
+        "Use LMCache with LMCacheUnifiedRadixCache",
         NS("memory"),
     ] = False
     lmcache_config_file: A[
