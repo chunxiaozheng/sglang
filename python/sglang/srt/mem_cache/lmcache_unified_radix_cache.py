@@ -185,6 +185,151 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return tensors
 
     @staticmethod
+    def _validate_page_native_tensors(
+        pool_name: str, tensors: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate tensors whose leading row is one complete SGLang page."""
+        if not tensors:
+            return tensors
+        shapes = [tuple(tensor.shape) for tensor in tensors]
+        if any(tensor.dim() != 2 for tensor in tensors):
+            raise NotImplementedError(
+                f"LMCache MP expects 2-D page-native {pool_name} buffers, "
+                f"got {shapes}"
+            )
+        if any(not tensor.is_contiguous() for tensor in tensors):
+            raise NotImplementedError(
+                f"LMCache MP requires contiguous page-native {pool_name} buffers"
+            )
+        block_counts = {tensor.shape[0] for tensor in tensors}
+        if len(block_counts) != 1:
+            raise ValueError(
+                f"DeepSeek V4 {pool_name} buffers expose different page counts: "
+                f"{sorted(block_counts)}"
+            )
+        return tensors
+
+    @classmethod
+    def _resolve_dsv4_full_page_tensors(cls, kv_pool) -> tuple[torch.Tensor, ...]:
+        """Resolve DS V4 C4/C128 data tied to the FULL page-id space.
+
+        DS V4 has no dense FULL KV tensor.  Its persistent prefix consists of
+        compressed C4 KV, the C4 indexer, and compressed C128 KV.  Every source
+        buffer row already contains all compressed slots belonging to one
+        logical 256-token FULL page, so all of them reuse the FULL block IDs.
+        """
+        if getattr(kv_pool, "_unified_kv", False):
+            raise NotImplementedError(
+                "LMCache DeepSeek V4 does not yet support ROCm unified_kv_triton; "
+                "its request-scoped SWA ring has no content-stable block-id space"
+            )
+
+        c4_pool = getattr(kv_pool, "c4_kv_pool", None)
+        if c4_pool is not None and hasattr(
+            c4_pool, "full_to_hisparse_device_index_mapping"
+        ):
+            raise NotImplementedError(
+                "LMCache DeepSeek V4 does not yet support HiSparse C4 remapping"
+            )
+
+        tensors: list[torch.Tensor] = []
+        for pool, field in (
+            (c4_pool, "kv_buffer"),
+            (getattr(kv_pool, "c4_indexer_kv_pool", None), "index_k_with_scale_buffer"),
+            (getattr(kv_pool, "c128_kv_pool", None), "kv_buffer"),
+        ):
+            buffers = getattr(pool, field, None) if pool is not None else None
+            if buffers:
+                tensors.extend(tensor for tensor in buffers if tensor.numel() > 0)
+
+        resolved = cls._validate_page_native_tensors("FULL sidecar", tuple(tensors))
+        if not resolved:
+            raise NotImplementedError(
+                "DeepSeek V4 pool has no locally owned C4/C128/indexer buffers"
+            )
+        return resolved
+
+    @classmethod
+    def _resolve_dsv4_swa_page_tensors(cls, kv_pool) -> tuple[torch.Tensor, ...]:
+        """Resolve DS V4 SWA KV and C4 compressor states by SWA page.
+
+        HiCache treats both C4 state pools as trailing-page sidecars of SWA.
+        Re-view each flat state ring as one opaque row per SWA page so it can
+        reuse exactly the same SWA block IDs.  C128 state is intentionally not
+        included: with the fixed 256-token page it is complete at a cached page
+        boundary, matching ``build_deepseek_v4_hicache_stack``.
+        """
+        swa_pool = getattr(kv_pool, "swa_kv_pool", None)
+        if swa_pool is None:
+            raise NotImplementedError(
+                "LMCache DeepSeek V4 requires the standard page-addressed SWA pool"
+            )
+
+        tensors: list[torch.Tensor] = [
+            tensor
+            for tensor in getattr(swa_pool, "kv_buffer", ())
+            if tensor.numel() > 0
+        ]
+        for state_pools in (
+            getattr(kv_pool, "compress_state_pools", ()),
+            getattr(kv_pool, "indexer_compress_state_pools", ()),
+        ):
+            for state_pool in state_pools:
+                if state_pool is None or state_pool.ratio != 4:
+                    continue
+                state = state_pool.kv_score_buffer.kv_score
+                if not state.is_contiguous():
+                    raise NotImplementedError(
+                        "LMCache DeepSeek V4 requires contiguous C4 state buffers"
+                    )
+                ring_size = int(state_pool.ring_size)
+                if ring_size <= 0:
+                    raise ValueError(
+                        f"DeepSeek V4 C4 state has invalid ring size {ring_size}"
+                    )
+                usable_rows = state.shape[0] // ring_size * ring_size
+                state_bytes = state.view(torch.uint8).reshape(state.shape[0], -1)
+                tensors.append(
+                    state_bytes[:usable_rows].reshape(usable_rows // ring_size, -1)
+                )
+
+        resolved = cls._validate_page_native_tensors("SWA/state", tuple(tensors))
+        if not resolved:
+            raise NotImplementedError(
+                "DeepSeek V4 pool has no locally owned SWA/state buffers"
+            )
+        return resolved
+
+    def _resolve_dsv4_registered_groups(self, kv_pool) -> list[LMCacheKVGroup]:
+        if tuple(self.tree_components) != (ComponentType.FULL, ComponentType.SWA):
+            names = [component.name for component in self.tree_components]
+            raise NotImplementedError(
+                "LMCache DeepSeek V4 expects FULL/SWA tree components, got "
+                f"{names}"
+            )
+
+        full_tensors = self._resolve_dsv4_full_page_tensors(kv_pool)
+        swa_tensors = self._resolve_dsv4_swa_page_tensors(kv_pool)
+        return [
+            LMCacheKVGroup(
+                name="full",
+                kv_tensors=full_tensors,
+                sliding_window_size=-1,
+                tokens_per_block=self.page_size,
+                slots_per_block=self.page_size,
+                tensor_rows_per_block=(1,) * len(full_tensors),
+            ),
+            LMCacheKVGroup(
+                name="swa",
+                kv_tensors=swa_tensors,
+                sliding_window_size=self._aligned_swa_window_size(),
+                tokens_per_block=self.page_size,
+                slots_per_block=self.page_size,
+                tensor_rows_per_block=(1,) * len(swa_tensors),
+            ),
+        ]
+
+    @staticmethod
     def _resolve_mamba_pool_tensors(mamba_pool) -> tuple[torch.Tensor, ...]:
         """Expose Mamba state as zero-copy tensors for LMCache registration.
 
@@ -240,6 +385,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def _resolve_registered_groups(self) -> list[LMCacheKVGroup]:
         """Map Unified tree components to LMCache engine KV groups."""
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        if isinstance(kv_pool, DeepSeekV4TokenToKVPool):
+            return self._resolve_dsv4_registered_groups(kv_pool)
+
         groups: list[LMCacheKVGroup] = []
         for component_type in self.tree_components:
             if component_type is ComponentType.FULL:
