@@ -25,6 +25,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     LMCacheStoreOperation,
     UnifiedLMCacheMPConnector,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -107,6 +108,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 )
         kv_groups = self._resolve_registered_groups()
         self._lmcache_component_types = tuple(self.tree_components)
+        # Match vLLM's MLA-only optimization.  A pure MLA cache is replicated
+        # across TP ranks, so LMCache stores one copy per PP stage and lets all
+        # TP ranks retrieve that shared object.  Hybrid component stacks stay
+        # on the general sharded path because not every component is guaranteed
+        # to be TP-replicated.
+        mla_only = (
+            model_config.attention_arch == AttentionArch.MLA
+            and components == (ComponentType.FULL,)
+        )
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
             model_name=model_config.model_path,
@@ -118,6 +128,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             pp_group=params.pp_cache_group,
             page_size=self.page_size,
             kv_groups=kv_groups,
+            mla_only=mla_only,
         )
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._pending_stores: list[_PendingStore] = []
