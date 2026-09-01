@@ -875,15 +875,27 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             self._lmcache_all_reduce(local_hit, torch.distributed.ReduceOp.MIN)
             total_hit = min(total_hit, len(flow.key))
-            if total_hit <= local_hit.item():
-                self.lmcache_connector.end_lookup(req_id)
+            local_hit_tokens = int(local_hit.item())
+            release_end = min(
+                total_hit,
+                local_hit_tokens
+                // self.lmcache_connector.chunk_size
+                * self.lmcache_connector.chunk_size,
+            )
+            if release_end > 0:
+                # Every rank advances the same local lookup state, while only
+                # the lookup leader sends FREE_LOOKUP_LOCKS to LMCache.
+                self.lmcache_connector.free_lookup_locks(
+                    req_id, start=0, end=release_end
+                )
+            if total_hit <= local_hit_tokens:
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid[req_id] = 0
                 return True
             flow.total_hit = total_hit
-            flow.local_hit_tokens = int(local_hit.item())
+            flow.local_hit_tokens = local_hit_tokens
             self.prefetch_loaded_tokens_by_reqid[req_id] = (
-                total_hit - local_hit.item()
+                total_hit - local_hit_tokens
             )
 
         if flow.load is not None and flow.load.result is False:
@@ -922,7 +934,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.free_mamba_after_load = False
         self._release_flow_anchor(flow)
         rid = flow.lookup.request_id
-        self.lmcache_connector.end_lookup(rid)
         self._external_flows.pop(rid, None)
         if flow.cancelled:
             self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
@@ -932,10 +943,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._finish_store_session_if_idle(rid)
 
     def _finish_successful_load(self, flow: _ExternalFlow) -> None:
-        """Release LMCache read locks while the request keeps loaded slots."""
+        """Finish local bookkeeping after LMCache has completed the retrieve."""
         assert flow.load is not None and flow.load.result
-        rid = flow.lookup.request_id
-        self.lmcache_connector.end_lookup(rid)
         self._release_unused_loaded_slots(flow)
         flow.mamba_value = None
         flow.allocated_mamba_for_load = False
@@ -1118,7 +1127,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._finished_store_requests.add(rid)
         flow = self._external_flows.get(rid)
         if flow is None:
-            self.lmcache_connector.end_lookup(rid)
             self._finish_store_session_if_idle(rid)
             return
         flow.cancelled = True
@@ -1130,7 +1138,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if flow.load_req is not None:
                 flow.load_req.mamba_pool_idx = None
         if flow.load is None:
-            self.lmcache_connector.end_lookup(rid)
             self._external_flows.pop(rid, None)
             self._finish_store_session_if_idle(rid)
         elif flow.load.result is not None:
@@ -1159,7 +1166,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
             self.prefetch_loaded_tokens_by_reqid.pop(req.rid, None)
-            self.lmcache_connector.end_lookup(req.rid)
             self._external_flows.pop(req.rid, None)
             return (
                 self.tree_core.empty_match_result.device_indices,
@@ -1196,7 +1202,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
                         flow.mamba_value = None
                     self._release_flow_anchor(flow)
-                connector.end_lookup(flow.lookup.request_id)
             for pending in list(getattr(self, "_pending_stores", [])):
                 try:
                     pending.operation.future.result(
