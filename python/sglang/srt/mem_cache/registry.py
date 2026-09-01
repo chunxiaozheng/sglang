@@ -177,6 +177,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_size=ctx.tp_size,
             tp_rank=ctx.tp_rank,
             lmcache_config_file=get_memory().lmcache_config_file,
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():

@@ -421,6 +421,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 tp_size=ctx.tp_size,
                 tp_rank=ctx.tp_rank,
                 lmcache_config_file=None,
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
             self.assertEqual(
                 ctx.params.tree_components,
