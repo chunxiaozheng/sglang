@@ -421,7 +421,23 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         for component_type in self.tree_components:
             if component_type is ComponentType.FULL:
                 component_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
-                sliding_window_size = -1
+                tensors = self._resolve_pool_tensors(component_pool)
+                tensor_rows_per_block = (self.page_size,) * len(tensors)
+                dsa_tensors = self._resolve_dsa_indexer_tensors(component_pool)
+                if dsa_tensors:
+                    tensors = (*tensors, *dsa_tensors)
+                    tensor_rows_per_block += (1,) * len(dsa_tensors)
+                groups.append(
+                    LMCacheKVGroup(
+                        name=component_type.name.lower(),
+                        kv_tensors=tensors,
+                        sliding_window_size=-1,
+                        tokens_per_block=self.page_size,
+                        slots_per_block=self.page_size,
+                        tensor_rows_per_block=tensor_rows_per_block,
+                        recurrent_state=False,
+                    )
+                )
             elif component_type is ComponentType.SWA:
                 component_pool = getattr(kv_pool, "swa_kv_pool", None)
                 if component_pool is None:
@@ -429,11 +445,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         f"SWA component requires an SWA KV sub-pool, got "
                         f"{type(kv_pool).__name__}"
                     )
-                sliding_window_size = self._aligned_swa_window_size()
-                tokens_per_block = self.page_size
-                slots_per_block = self.page_size
-                recurrent_state = False
                 tensors = self._resolve_pool_tensors(component_pool)
+                groups.append(
+                    LMCacheKVGroup(
+                        name=component_type.name.lower(),
+                        kv_tensors=tensors,
+                        sliding_window_size=self._aligned_swa_window_size(),
+                        tokens_per_block=self.page_size,
+                        slots_per_block=self.page_size,
+                        tensor_rows_per_block=(self.page_size,) * len(tensors),
+                        recurrent_state=False,
+                    )
+                )
             elif component_type is ComponentType.MAMBA:
                 mamba_pool = self.req_to_token_pool.mamba_pool
                 checkpoint_grid = self._mamba_component.mamba_checkpoint_grid
@@ -454,32 +477,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                         recurrent_state=True,
                     )
                 )
-                continue
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
-            if component_type is ComponentType.FULL:
-                tokens_per_block = self.page_size
-                slots_per_block = self.page_size
-                recurrent_state = False
-                tensors = self._resolve_pool_tensors(component_pool)
-                tensor_rows_per_block = (self.page_size,) * len(tensors)
-                dsa_tensors = self._resolve_dsa_indexer_tensors(component_pool)
-                if dsa_tensors:
-                    tensors = (*tensors, *dsa_tensors)
-                    tensor_rows_per_block += (1,) * len(dsa_tensors)
-            else:
-                tensor_rows_per_block = (self.page_size,) * len(tensors)
-            groups.append(
-                LMCacheKVGroup(
-                    name=component_type.name.lower(),
-                    kv_tensors=tensors,
-                    sliding_window_size=sliding_window_size,
-                    tokens_per_block=tokens_per_block,
-                    slots_per_block=slots_per_block,
-                    tensor_rows_per_block=tensor_rows_per_block,
-                    recurrent_state=recurrent_state,
-                )
-            )
         return groups
 
     def _aligned_swa_window_size(self) -> int:
