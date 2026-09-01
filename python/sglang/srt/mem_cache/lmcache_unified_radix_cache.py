@@ -14,7 +14,7 @@ import hashlib
 import logging
 from array import array
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -30,8 +30,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     InitLoadBackParams,
-    InsertParams,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -49,10 +49,17 @@ logger = logging.getLogger(__name__)
 class _ExternalFlow:
     key: RadixKey
     lookup: LMCacheLookupOperation
+    total_hit: Optional[int] = None
+    local_hit_tokens: Optional[int] = None
     load: Optional[LMCacheLoadOperation] = None
     anchor_node: Optional[NodeId] = None
     anchor_lock: Optional[DecLockRefParams] = None
     mamba_value: Optional[torch.Tensor] = None
+    allocated_mamba_for_load: bool = False
+    load_req: Optional[Req] = None
+    free_mamba_after_load: bool = False
+    loaded_skip_tokens: int = 0
+    released_skip_tokens: int = 0
     cancelled: bool = False
 
 
@@ -74,6 +81,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         tp_size: int,
         tp_rank: int,
         lmcache_config_file: Optional[str],
+        forward_stream: Any,
     ) -> None:
         components = tuple(params.tree_components or ())
         if not components or components[0] is not ComponentType.FULL:
@@ -131,6 +139,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mla_only=mla_only,
         )
         self._external_flows: dict[str, _ExternalFlow] = {}
+        self._forward_stream = forward_stream
         self._pending_stores: list[_PendingStore] = []
         self._finished_store_requests: set[str] = set()
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -575,6 +584,86 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # sequence rather than from a host-tree hash chain.
         return True
 
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        """Expose a completed LMCache lookup as a request-scoped host hit.
+
+        LMCache owns its CPU staging memory, so there is no SGLang host tree to
+        match.  Before admission, report the externally ready suffix through
+        the existing host-hit fields.  Once ``init_load_back`` has assigned
+        private GPU slots, expose those slots directly if admission retries.
+        """
+        requested_key_len = len(params.key)
+        req = params.req
+        flow = self._external_flows.get(req.rid) if req is not None else None
+        if (
+            flow is not None
+            and flow.total_hit is not None
+            and flow.local_hit_tokens is not None
+            and flow.load is None
+        ):
+            # Every rank must take the same host-hit/init_load_back branch.
+            # Restrict the second match to the shortest L1 prefix observed
+            # across TP x PP when lookup completed.
+            params = MatchPrefixParams(
+                key=params.key[: flow.local_hit_tokens],
+                cow_mamba=params.cow_mamba,
+                req=req,
+            )
+        elif flow is not None and flow.load is not None and params.cow_mamba:
+            # The request already owns the Mamba state filled by LMCache. A
+            # retry match must not arm the normal tree-state COW and overwrite
+            # that externally loaded state before forward.
+            params = MatchPrefixParams(key=params.key, cow_mamba=False, req=req)
+        result = super().match_prefix(params)
+        if req is None:
+            return result
+        if flow is None or flow.total_hit is None or flow.cancelled:
+            return result
+
+        total_hit = min(flow.total_hit, requested_key_len, len(flow.key))
+        local_hit = len(result.device_indices)
+        if total_hit <= local_hit:
+            return result
+
+        if flow.load is None:
+            external_hit = total_hit - local_hit
+            return result._replace(
+                last_host_node=result.last_device_node,
+                best_match_node=result.last_device_node,
+                host_hit_length=external_hit,
+                swa_host_hit_length=(
+                    min(external_hit, self._aligned_swa_window_size())
+                    if self.is_swa_enabled
+                    else 0
+                ),
+                mamba_host_hit_length=(
+                    1 if self._mamba_component is not None else 0
+                ),
+                mamba_branching_seqlen=None,
+                full_kv_hit_length=max(result.full_kv_hit_length, total_hit),
+            )
+
+        # ``init_load_back`` may have submitted H2D for a request that did not
+        # make the final batch. Preserve its private slots across the next
+        # admission attempt; the forward stream already waits on this load.
+        skip = max(local_hit - flow.load.local_hit_tokens, 0)
+        flow.loaded_skip_tokens = max(flow.loaded_skip_tokens, skip)
+        if flow.load.result:
+            self._release_unused_loaded_slots(flow)
+        suffix = flow.load.device_indices[
+            skip : skip + max(total_hit - local_hit, 0)
+        ]
+        return result._replace(
+            device_indices=torch.cat([result.device_indices, suffix]),
+            last_host_node=result.last_device_node,
+            best_match_node=result.last_device_node,
+            host_hit_length=0,
+            swa_host_hit_length=0,
+            mamba_host_hit_length=0,
+            mamba_branching_seqlen=None,
+            full_kv_hit_length=max(result.full_kv_hit_length, total_hit),
+        )
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -662,32 +751,34 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             allocator.set_full_to_swa_mapping(tail_full_indices, swa_indices)
         return full_indices
 
-    def _start_external_load(self, flow: _ExternalFlow, total_hit: int) -> bool:
-        latest = super().match_prefix(MatchPrefixParams(key=flow.key))
-        local_hit = len(latest.device_indices)
-        # PP stages can have different local capacities. Retrieve from the
-        # shortest common L1 boundary so every globally locked LMCache piece
-        # is either consumed or explicitly released by the same token range.
-        common_local_hit = torch.tensor([local_hit], dtype=torch.int64, device="cpu")
-        self._lmcache_all_reduce(common_local_hit, torch.distributed.ReduceOp.MIN)
-        local_hit = int(common_local_hit.item())
-        total_hit = min(total_hit, len(flow.key))
+    def _start_external_load(
+        self, flow: _ExternalFlow, req: Req
+    ) -> Optional[torch.Tensor]:
+        assert flow.total_hit is not None
+        assert flow.local_hit_tokens is not None
+        local_hit = flow.local_hit_tokens
+        latest = super().match_prefix(
+            MatchPrefixParams(key=flow.key[:local_hit])
+        )
+        total_hit = min(flow.total_hit, len(flow.key))
         if total_hit <= local_hit:
-            self.prefetch_loaded_tokens_by_reqid[flow.lookup.request_id] = 0
-            return False
+            return self.tree_core.empty_match_result.device_indices
 
-        # Pin the exact L1 boundary before allocation: allocator eviction may
-        # run below, and the latest match can be deeper than the request's
-        # original (already pinned) prefix.
+        # Pin the common L1 boundary before allocation because allocator
+        # eviction may run below. Every rank intentionally loads from this
+        # same boundary even if a particular local tree had matched deeper.
         flow.anchor_node = latest.last_device_node
         flow.anchor_lock = self.inc_lock_ref(flow.anchor_node).to_dec_params()
         num_tokens = total_hit - local_hit
         device_indices = self._allocate_external_slots(num_tokens)
-        mamba_value = (
-            self._allocate_external_mamba_slot()
-            if device_indices is not None and self._mamba_component is not None
-            else None
-        )
+        mamba_value = None
+        allocated_mamba_for_load = False
+        if device_indices is not None and self._mamba_component is not None:
+            if req.mamba_pool_idx is None:
+                mamba_value = self._allocate_external_mamba_slot()
+                allocated_mamba_for_load = mamba_value is not None
+            else:
+                mamba_value = req.mamba_pool_idx.reshape(1)
         allocation_ok = torch.tensor(
             [
                 int(
@@ -704,7 +795,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if not allocation_ok.item():
             if device_indices is not None:
                 self.token_to_kv_pool_allocator.free(device_indices)
-            if mamba_value is not None:
+            if allocated_mamba_for_load and mamba_value is not None:
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
@@ -713,13 +804,26 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.lookup.request_id,
                 num_tokens,
             )
-            return False
+            return None
         assert device_indices is not None
         flow.mamba_value = mamba_value
+        flow.allocated_mamba_for_load = allocated_mamba_for_load
+        flow.load_req = req
+        flow.free_mamba_after_load = allocated_mamba_for_load
+        flow.loaded_skip_tokens = 0
+        if allocated_mamba_for_load:
+            assert mamba_value is not None
+            req.mamba_pool_idx = mamba_value[0]
+            req.mamba_needs_clear = False
 
         try:
             load_start = local_hit // self.lmcache_connector.chunk_size
             load_start *= self.lmcache_connector.chunk_size
+            # The connector records a producer event on SGLang's forward
+            # stream, makes LMCache's server-side H2D stream wait for it, then
+            # imports the final all-layer completion event back into this
+            # process.  The second call queues a wait on the forward stream;
+            # it does not synchronize H2D on the scheduler CPU thread.
             flow.load = self.lmcache_connector.submit_load(
                 flow.lookup,
                 self._device_indices_by_group(
@@ -729,20 +833,30 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 ),
                 local_hit_tokens=local_hit,
                 owned_device_indices=device_indices,
+                producer_stream=self._forward_stream,
             )
+            if not self.lmcache_connector.prepare_load_on_stream(
+                flow.load, self._forward_stream
+            ):
+                raise RuntimeError("LMCache server rejected the retrieve request")
         except Exception:
             self.token_to_kv_pool_allocator.free(device_indices)
-            if mamba_value is not None:
+            if allocated_mamba_for_load and mamba_value is not None:
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
-                flow.mamba_value = None
+                req.mamba_pool_idx = None
+            flow.mamba_value = None
+            flow.allocated_mamba_for_load = False
+            flow.load_req = None
+            flow.free_mamba_after_load = False
             self.dec_lock_ref(flow.anchor_node, flow.anchor_lock)
             flow.anchor_node = None
             flow.anchor_lock = None
             logger.exception(
                 "LMCache retrieve submission failed for %s", flow.lookup.request_id
             )
-            return False
-        return True
+            flow.load = None
+            return None
+        return device_indices[flow.loaded_skip_tokens :]
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         flow = self._external_flows.get(req_id)
@@ -751,24 +865,30 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow.cancelled:
             return False
 
-        if flow.load is None:
+        if flow.total_hit is None:
             total_hit = self.lmcache_connector.poll_lookup(flow.lookup)
             if total_hit is None:
                 return False
-            if not self._start_external_load(flow, total_hit):
+            latest = super().match_prefix(MatchPrefixParams(key=flow.key))
+            local_hit = torch.tensor(
+                [len(latest.device_indices)], dtype=torch.int64, device="cpu"
+            )
+            self._lmcache_all_reduce(local_hit, torch.distributed.ReduceOp.MIN)
+            total_hit = min(total_hit, len(flow.key))
+            if total_hit <= local_hit.item():
                 self.lmcache_connector.end_lookup(req_id)
                 self._external_flows.pop(req_id, None)
-                self.prefetch_loaded_tokens_by_reqid.setdefault(req_id, 0)
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
                 return True
-            return False
+            flow.total_hit = total_hit
+            flow.local_hit_tokens = int(local_hit.item())
+            self.prefetch_loaded_tokens_by_reqid[req_id] = (
+                total_hit - local_hit.item()
+            )
 
-        if flow.load.result is None:
-            return False
-        if not flow.load.result:
+        if flow.load is not None and flow.load.result is False:
             self._finish_failed_load(flow)
             return True
-
-        self._publish_loaded_prefix(flow)
         return True
 
     def _release_flow_anchor(self, flow: _ExternalFlow) -> None:
@@ -777,12 +897,29 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.anchor_node = None
         flow.anchor_lock = None
 
+    def _release_unused_loaded_slots(self, flow: _ExternalFlow) -> None:
+        """Free retrieved slots shadowed by a longer rank-local L1 prefix."""
+        assert flow.load is not None
+        release_end = min(flow.loaded_skip_tokens, len(flow.load.device_indices))
+        if release_end <= flow.released_skip_tokens:
+            return
+        self.token_to_kv_pool_allocator.free(
+            flow.load.device_indices[flow.released_skip_tokens : release_end]
+        )
+        flow.released_skip_tokens = release_end
+
     def _finish_failed_load(self, flow: _ExternalFlow) -> None:
         assert flow.load is not None
-        self.token_to_kv_pool_allocator.free(flow.load.device_indices)
-        if flow.mamba_value is not None:
+        self.token_to_kv_pool_allocator.free(
+            flow.load.device_indices[flow.released_skip_tokens :]
+        )
+        if flow.free_mamba_after_load and flow.mamba_value is not None:
             self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+            if flow.load_req is not None:
+                flow.load_req.mamba_pool_idx = None
             flow.mamba_value = None
+        flow.load_req = None
+        flow.free_mamba_after_load = False
         self._release_flow_anchor(flow)
         rid = flow.lookup.request_id
         self.lmcache_connector.end_lookup(rid)
@@ -794,45 +931,31 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if rid in self._finished_store_requests:
             self._finish_store_session_if_idle(rid)
 
-    def _publish_loaded_prefix(self, flow: _ExternalFlow) -> None:
+    def _finish_successful_load(self, flow: _ExternalFlow) -> None:
+        """Release LMCache read locks while the request keeps loaded slots."""
         assert flow.load is not None and flow.load.result
         rid = flow.lookup.request_id
-        total_hit = flow.load.end
-        latest = super().match_prefix(MatchPrefixParams(key=flow.key))
-        local_hit = len(latest.device_indices)
-        skip = max(local_hit - flow.load.local_hit_tokens, 0)
-        if skip:
-            self.token_to_kv_pool_allocator.free(flow.load.device_indices[:skip])
-        suffix = flow.load.device_indices[skip : skip + max(total_hit - local_hit, 0)]
-
-        if local_hit < total_hit:
-            combined = torch.cat([latest.device_indices, suffix])
-            insert_result = self.insert(
-                InsertParams(
-                    key=flow.key[:total_hit],
-                    value=combined,
-                    mamba_value=flow.mamba_value,
-                    prev_prefix_len=local_hit,
-                    swa_evicted_seqlen=(
-                        max(0, total_hit - self._aligned_swa_window_size())
-                        if self.is_swa_enabled
-                        else 0
-                    ),
-                )
-            )
-            if insert_result.mamba_exist and flow.mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
-        else:
-            if suffix.numel():
-                self.token_to_kv_pool_allocator.free(suffix)
-            if flow.mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
-        flow.mamba_value = None
-
-        self.prefetch_loaded_tokens_by_reqid[rid] = max(total_hit - local_hit, 0)
-        self._release_flow_anchor(flow)
         self.lmcache_connector.end_lookup(rid)
-        self._external_flows.pop(rid, None)
+        self._release_unused_loaded_slots(flow)
+        flow.mamba_value = None
+        flow.allocated_mamba_for_load = False
+        flow.load_req = None
+        flow.free_mamba_after_load = False
+
+    def _retire_loaded_flow(self, rid: str) -> None:
+        flow = self._external_flows.get(rid)
+        if flow is None or flow.load is None:
+            return
+        if flow.load.result is None:
+            if not flow.load.query():
+                return
+            self.lmcache_connector.complete_load(flow.load)
+        if flow.load.result:
+            self._finish_successful_load(flow)
+            self._release_flow_anchor(flow)
+            self._external_flows.pop(rid, None)
+        else:
+            self._finish_failed_load(flow)
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
@@ -919,6 +1042,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         super().cache_unfinished_req(req, chunked=chunked, **kwargs)
+        self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.get_fill_ids())
 
     def cache_finished_req(
@@ -932,6 +1056,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             kv_len_to_handle=kv_len_to_handle,
             **kwargs,
         )
+        self._retire_loaded_flow(req.rid)
         if is_insert:
             token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
             self._submit_store(req, token_ids)
@@ -976,6 +1101,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.lmcache_connector.complete_load(flow.load)
             if flow.cancelled:
                 self._finish_failed_load(flow)
+            elif flow.load.result:
+                self._finish_successful_load(flow)
 
         ready_stores = self._ready_prefix_count(
             [pending.operation for pending in self._pending_stores]
@@ -995,6 +1122,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._finish_store_session_if_idle(rid)
             return
         flow.cancelled = True
+        # Generic request cleanup would otherwise return the Mamba slot while
+        # LMCache's CUDA stream may still be writing it. Detach it from the
+        # request and let the completion path free it after the device event.
+        if flow.load is not None and flow.mamba_value is not None:
+            flow.free_mamba_after_load = True
+            if flow.load_req is not None:
+                flow.load_req.mamba_pool_idx = None
         if flow.load is None:
             self.lmcache_connector.end_lookup(rid)
             self._external_flows.pop(rid, None)
@@ -1005,9 +1139,33 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def init_load_back(
         self, params: InitLoadBackParams
     ) -> tuple[torch.Tensor, NodeId]:
-        # LMCache retrieves are completed before the request is admitted, so
-        # the scheduler should never observe an external hit as a host hit.
-        return self.tree_core.empty_match_result.device_indices, params.best_match_node
+        req = params.req
+        if req is None:
+            return (
+                self.tree_core.empty_match_result.device_indices,
+                params.best_match_node,
+            )
+        flow = self._external_flows.get(req.rid)
+        if flow is None or flow.total_hit is None or flow.load is not None:
+            return (
+                self.tree_core.empty_match_result.device_indices,
+                params.best_match_node,
+            )
+
+        device_indices = self._start_external_load(flow, req)
+        if device_indices is None:
+            req.storage_hit_length = 0
+            req.host_hit_length = 0
+            req.swa_host_hit_length = 0
+            req.mamba_host_hit_length = 0
+            self.prefetch_loaded_tokens_by_reqid.pop(req.rid, None)
+            self.lmcache_connector.end_lookup(req.rid)
+            self._external_flows.pop(req.rid, None)
+            return (
+                self.tree_core.empty_match_result.device_indices,
+                params.best_match_node,
+            )
+        return device_indices, params.best_match_node
 
     def ready_to_load_host_cache(self) -> int:
         return -1
@@ -1031,7 +1189,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     except Exception:
                         pass
                     connector.complete_load(flow.load, synchronize=False)
-                    self.token_to_kv_pool_allocator.free(flow.load.device_indices)
+                    self.token_to_kv_pool_allocator.free(
+                        flow.load.device_indices[flow.released_skip_tokens :]
+                    )
                     if flow.mamba_value is not None:
                         self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
                         flow.mamba_value = None
