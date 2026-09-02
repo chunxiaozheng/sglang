@@ -299,11 +299,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 "LMCache DeepSeek V4 requires the standard page-addressed SWA pool"
             )
 
-        tensors: list[torch.Tensor] = [
+        swa_tensors = tuple(
             tensor
             for tensor in getattr(swa_pool, "kv_buffer", ())
             if tensor.numel() > 0
-        ]
+        )
+        resolved_swa = cls._validate_page_native_tensors("SWA", swa_tensors)
+        if not resolved_swa:
+            raise NotImplementedError(
+                "DeepSeek V4 pool has no locally owned SWA buffers"
+            )
+        swa_page_count = resolved_swa[0].shape[0]
+        tensors: list[torch.Tensor] = list(resolved_swa)
         for state_pools in (
             getattr(kv_pool, "compress_state_pools", ()),
             getattr(kv_pool, "indexer_compress_state_pools", ()),
@@ -323,9 +330,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     )
                 usable_rows = state.shape[0] // ring_size * ring_size
                 state_bytes = state.view(torch.uint8).reshape(state.shape[0], -1)
-                tensors.append(
-                    state_bytes[:usable_rows].reshape(usable_rows // ring_size, -1)
+                state_pages = state_bytes[:usable_rows].reshape(
+                    usable_rows // ring_size, -1
                 )
+                if state_pages.shape[0] < swa_page_count:
+                    raise ValueError(
+                        "DeepSeek V4 C4 state exposes fewer pages than its SWA "
+                        f"pool: {state_pages.shape[0]} < {swa_page_count}"
+                    )
+                # State backing may include extra capacity, but SWA block IDs can
+                # address only the page range exposed by the SWA KV pool.
+                tensors.append(state_pages[:swa_page_count])
 
         resolved = cls._validate_page_native_tensors("SWA/state", tuple(tensors))
         if not resolved:
