@@ -819,11 +819,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         try:
             load_start = local_hit // self.lmcache_connector.chunk_size
             load_start *= self.lmcache_connector.chunk_size
-            # The connector records a producer event on SGLang's forward
-            # stream, makes LMCache's server-side H2D stream wait for it, then
-            # imports the final all-layer completion event back into this
-            # process.  The second call queues a wait on the forward stream;
-            # it does not synchronize H2D on the scheduler CPU thread.
+            # Submit while admission can still fall back to ordinary prefill.
+            # The stream wait is asynchronous and does not block the scheduler CPU.
             flow.load = self.lmcache_connector.submit_load(
                 flow.lookup,
                 self._device_indices_by_group(
@@ -1174,6 +1171,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return device_indices, params.best_match_node
 
     def ready_to_load_host_cache(self) -> int:
+        # the H2D operation has been submitted in `init_load_back`,
+        # because if submit retrieve failed, we can fall back to
+        # the normal prefill, so there is nothing to do here.
         return -1
 
     def supports_retraction_backup(self) -> bool:
