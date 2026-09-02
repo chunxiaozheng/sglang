@@ -492,12 +492,7 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_unified_lmcache = get_memory().enable_unified_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
-        # Both HiCache L3 and Unified LMCache use the scheduler's asynchronous
-        # prefetch staging loop. The selected tree cache owns the concrete I/O.
-        self.enable_hicache_storage = (
-            get_memory().hicache_storage_backend is not None
-            or self.enable_unified_lmcache
-        )
+        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -3074,7 +3069,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_unified_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3206,6 +3201,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or self.enable_hicache_storage
             or self.enable_unified_cache_external_linker
+            or self.enable_unified_lmcache
         ):
             self.tree_cache.release_aborted_request(rid)
 
@@ -3821,7 +3817,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_unified_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
