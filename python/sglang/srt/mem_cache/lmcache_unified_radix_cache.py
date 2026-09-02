@@ -978,13 +978,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         else:
             self._finish_failed_load(flow)
 
-    def _restore_tree_owned_prefix_len(self, req: Req) -> None:
-        """Exclude private LMCache slots from the tree-owned prefix boundary.
+    def _prepare_external_slots_for_insert(self, req: Req) -> None:
+        """Restore tree ownership and describe LMCache's sparse SWA suffix.
 
         Admission temporarily includes loaded slots in ``cache_protected_len``
         so they remain attached to the request.  Unified cache insertion uses
         that field as an ownership boundary, however, and would otherwise
         neither insert nor free an out-of-window SWA page loaded by LMCache.
+
+        LMCache allocates SWA slots only for the trailing window of an external
+        hit.  Mark its older FULL-only range as SWA-evicted so insertion creates
+        tombstones there even when generic out-of-window freeing is disabled.
         """
         flow = self._external_flows.get(req.rid)
         if flow is None or flow.load is None:
@@ -993,6 +997,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         req.kv.cache_protected_len = min(
             req.kv.cache_protected_len, tree_owned_len
         )
+        if self.is_swa_enabled:
+            external_tokens = len(flow.load.device_indices)
+            swa_missing_end = flow.load.local_hit_tokens + max(
+                external_tokens - self._aligned_swa_window_size(), 0
+            )
+            req.kv.swa_evicted_seqlen = max(
+                req.kv.swa_evicted_seqlen, swa_missing_end
+            )
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
@@ -1078,7 +1090,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._restore_tree_owned_prefix_len(req)
+        self._prepare_external_slots_for_insert(req)
         super().cache_unfinished_req(req, chunked=chunked, **kwargs)
         self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.get_fill_ids())
@@ -1089,7 +1101,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if not is_insert:
             self.release_aborted_request(req.rid)
         else:
-            self._restore_tree_owned_prefix_len(req)
+            self._prepare_external_slots_for_insert(req)
         super().cache_finished_req(
             req,
             is_insert=is_insert,
