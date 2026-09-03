@@ -25,7 +25,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     LMCacheStoreOperation,
     UnifiedLMCacheMPConnector,
 )
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_v4
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -127,7 +127,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             pp_group=params.pp_cache_group,
             page_size=self.page_size,
             kv_groups=kv_groups,
-            mla_enabled=model_config.attention_arch == AttentionArch.MLA,
+            # SGLang classifies DS V4 as MHA for its custom attention backend,
+            # but its page-native KV is still replicated across TP like MLA.
+            mla_enabled=(
+                model_config.attention_arch == AttentionArch.MLA
+                or is_deepseek_v4(model_config.hf_config)
+            ),
         )
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._forward_stream = forward_stream
