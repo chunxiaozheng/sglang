@@ -687,6 +687,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         total_hit = min(flow.total_hit, requested_key_len, len(flow.key))
         local_hit = len(result.device_indices)
+        skip = 0
+        if flow.load is not None:
+            # Another request may publish part or all of this prefix while our
+            # retrieve is in flight. Record the shadowed private slots before
+            # the fully-local early return below, otherwise a later insert may
+            # mistake canonical tree slots for request-owned duplicates.
+            skip = max(
+                min(local_hit, total_hit) - flow.load.local_hit_tokens,
+                0,
+            )
+            flow.loaded_skip_tokens = max(flow.loaded_skip_tokens, skip)
+            if flow.load.result:
+                self._release_unused_loaded_slots(flow)
         if total_hit <= local_hit:
             return result
 
@@ -711,10 +724,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # ``init_load_back`` may have submitted H2D for a request that did not
         # make the final batch. Preserve its private slots across the next
         # admission attempt; the forward stream already waits on this load.
-        skip = max(local_hit - flow.load.local_hit_tokens, 0)
-        flow.loaded_skip_tokens = max(flow.loaded_skip_tokens, skip)
-        if flow.load.result:
-            self._release_unused_loaded_slots(flow)
         suffix = flow.load.device_indices[
             skip : skip + max(total_hit - local_hit, 0)
         ]
@@ -1032,7 +1041,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load_req.kv.mamba_cow_src_index = None
             flow.mamba_value = None
         if (
-            flow.allocated_request_mamba_for_load
+            not flow.cancelled
+            and flow.allocated_request_mamba_for_load
             and flow.request_mamba_value is not None
             and flow.load_req is not None
             and flow.load_req.kv.mamba_pool_idx is not None
@@ -1085,7 +1095,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._finish_successful_load(flow)
             if flow.mamba_value is not None:
                 # Successful loads normally transfer checkpoint ownership to
-                # the tree in _publish_external_mamba_checkpoint().  Keep this
+                # the tree in _publish_external_loaded_prefix().  Keep this
                 # fallback for any request path that retires without inserting.
                 if (
                     flow.load_req is not None
@@ -1132,10 +1142,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 req.kv.swa_evicted_seqlen, swa_missing_end
             )
 
-    def _publish_external_mamba_checkpoint(
+    def _publish_external_loaded_prefix(
         self, req: Req, *, token_ids_len: int
     ) -> None:
-        """Publish an LMCache-restored Mamba boundary into the device tree.
+        """Publish an LMCache-restored unified prefix into the device tree.
 
         Full/SWA slots loaded by LMCache remain request-owned until this normal
         cache callback.  At that point insert adopts those same slots and the
@@ -1144,6 +1154,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         it and may have mutated it.
         """
         flow = self._external_flows.get(req.rid)
+        # Always restore the real tree-owned boundary first. For Full/SWA-only
+        # flows, the regular UnifiedRadixCache callback below will adopt the
+        # loaded suffix; Mamba flows publish their exact checkpoint here.
+        self._prepare_external_slots_for_insert(req)
         if (
             flow is None
             or flow.load is None
@@ -1161,9 +1175,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if total_hit <= 0:
             return
 
-        # Convert the temporary admission ownership boundary back to the
-        # portion already owned by the tree before inserting the loaded suffix.
-        self._prepare_external_slots_for_insert(req)
         prev_prefix_len = min(req.kv.cache_protected_len, total_hit)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :token_ids_len
@@ -1312,10 +1323,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._publish_external_mamba_checkpoint(
+        self._publish_external_loaded_prefix(
             req, token_ids_len=len(req.get_fill_ids())
         )
-        self._prepare_external_slots_for_insert(req)
         super().cache_unfinished_req(req, chunked=chunked, **kwargs)
         self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.get_fill_ids())
@@ -1326,10 +1336,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if not is_insert:
             self.release_aborted_request(req.rid)
         else:
-            self._publish_external_mamba_checkpoint(
+            self._publish_external_loaded_prefix(
                 req, token_ids_len=kv_len_to_handle
             )
-            self._prepare_external_slots_for_insert(req)
         super().cache_finished_req(
             req,
             is_insert=is_insert,
@@ -1416,7 +1425,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             ):
                 flow.load_req.kv.mamba_cow_src_index = None
         if flow.load is None:
-            self._external_flows.pop(rid, None)
+            if flow.total_hit is not None:
+                # LOOKUP completed but no RETRIEVE was submitted, so no H2D
+                # completion callback will consume its remaining read locks.
+                self._retire_loaded_flow(rid)
+            else:
+                # END_SESSION, issued below, is ordered after the in-flight
+                # LOOKUP and releases any locks it may eventually acquire.
+                self._external_flows.pop(rid, None)
             self._finish_session_if_idle(rid)
         elif flow.load.result is not None:
             self._finish_failed_load(flow)
@@ -1445,7 +1461,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.mamba_host_hit_length = 0
             self.prefetch_loaded_tokens_by_reqid.pop(req.rid, None)
             self.prefetch_loaded_storage_start_by_reqid.pop(req.rid, None)
-            self._external_flows.pop(req.rid, None)
+            # No retrieve will consume the remaining lookup locks. Retire the
+            # unloaded flow through the normal range-aware release path.
+            self._retire_loaded_flow(req.rid)
             return (
                 self.tree_core.empty_match_result.device_indices,
                 params.best_match_node,
