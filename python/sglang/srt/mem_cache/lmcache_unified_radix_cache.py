@@ -994,7 +994,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _retire_loaded_flow(self, rid: str) -> None:
         flow = self._external_flows.get(rid)
-        if flow is None or flow.load is None:
+        if flow is None:
+            return
+        if flow.load is None:
+            if flow.total_hit is None:
+                return
+            self.lmcache_connector.free_lookup_locks(
+                rid,
+                start=flow.lookup.lock_start,
+                end=flow.total_hit,
+            )
+            self._external_flows.pop(rid, None)
+            self._finish_store_session_if_idle(rid)
             return
         if flow.load.result is None:
             if not flow.load.query():
@@ -1305,3 +1316,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self.reset()
         self.lmcache_connector.close()
         self._lmcache_closed = True
+
+    def release_host_resources(self) -> None:
+        self.shutdown()
