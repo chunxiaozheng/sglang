@@ -139,7 +139,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[_PendingStore] = []
-        self._finished_store_requests: set[str] = set()
+        self._finished_requests: set[str] = set()
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self._lmcache_closed = False
         # Kept only for compatibility with the scheduler's existing HiCache
@@ -980,8 +980,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         else:
             self.prefetch_loaded_tokens_by_reqid[rid] = 0
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
-        if rid in self._finished_store_requests:
-            self._finish_store_session_if_idle(rid)
+        if rid in self._finished_requests:
+            self._finish_session_if_idle(rid)
 
     def _finish_successful_load(self, flow: _ExternalFlow) -> None:
         """Finish local bookkeeping after LMCache has completed the retrieve."""
@@ -1005,7 +1005,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 end=flow.total_hit,
             )
             self._external_flows.pop(rid, None)
-            self._finish_store_session_if_idle(rid)
             return
         if flow.load.result is None:
             if not flow.load.query():
@@ -1153,15 +1152,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if is_insert:
             token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
             self._submit_store(req, token_ids)
-        self._finished_store_requests.add(req.rid)
-        self._finish_store_session_if_idle(req.rid)
+        self._finished_requests.add(req.rid)
+        self._finish_session_if_idle(req.rid)
 
-    def _finish_store_session_if_idle(self, rid: str) -> None:
-        if rid not in self._finished_store_requests:
+    def _finish_session_if_idle(self, rid: str) -> None:
+        if rid not in self._finished_requests:
             return
         if self._has_pending_store(rid) or rid in self._external_flows:
             return
-        self._finished_store_requests.discard(rid)
+        self._finished_requests.discard(rid)
         self.lmcache_connector.finish_request(rid)
 
     def _has_pending_store(self, rid: str) -> bool:
@@ -1204,7 +1203,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             pending = self._pending_stores.pop(0)
             self.lmcache_connector.complete_store(pending.operation)
             self.dec_lock_ref(pending.node_id, pending.lock_params)
-            self._finish_store_session_if_idle(pending.operation.request_id)
+            self._finish_session_if_idle(pending.operation.request_id)
 
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
@@ -1212,10 +1211,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
-        self._finished_store_requests.add(rid)
+        self._finished_requests.add(rid)
         flow = self._external_flows.get(rid)
         if flow is None:
-            self._finish_store_session_if_idle(rid)
+            self._finish_session_if_idle(rid)
             return
         flow.cancelled = True
         # Generic request cleanup would otherwise return the Mamba slot while
@@ -1227,7 +1226,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load_req.kv.mamba_pool_idx = None
         if flow.load is None:
             self._external_flows.pop(rid, None)
-            self._finish_store_session_if_idle(rid)
+            self._finish_session_if_idle(rid)
         elif flow.load.result is not None:
             self._finish_failed_load(flow)
 
@@ -1305,7 +1304,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._external_flows.clear()
             self._pending_stores.clear()
-            self._finished_store_requests.clear()
+            self._finished_requests.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()
