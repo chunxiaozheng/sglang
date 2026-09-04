@@ -63,6 +63,7 @@ class _ExternalFlow:
     free_mamba_after_load: bool = False
     loaded_skip_tokens: int = 0
     released_skip_tokens: int = 0
+    loaded_slots_published: bool = False
     cancelled: bool = False
 
 
@@ -688,11 +689,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         total_hit = min(flow.total_hit, requested_key_len, len(flow.key))
         local_hit = len(result.device_indices)
         skip = 0
-        if flow.load is not None:
+        if flow.load is not None and not flow.loaded_slots_published:
             # Another request may publish part or all of this prefix while our
             # retrieve is in flight. Record the shadowed private slots before
-            # the fully-local early return below, otherwise a later insert may
-            # mistake canonical tree slots for request-owned duplicates.
+            # the fully-local early return below. Once this flow starts its own
+            # insert, however, the same local prefix is tree-owned and must not
+            # be released as if another request had shadowed it.
             skip = max(
                 min(local_hit, total_hit) - flow.load.local_hit_tokens,
                 0,
@@ -1029,9 +1031,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _finish_failed_load(self, flow: _ExternalFlow) -> None:
         assert flow.load is not None
-        self.token_to_kv_pool_allocator.free(
-            flow.load.device_indices[flow.released_skip_tokens :]
-        )
+        if not flow.loaded_slots_published:
+            self.token_to_kv_pool_allocator.free(
+                flow.load.device_indices[flow.released_skip_tokens :]
+            )
         if flow.free_mamba_after_load and flow.mamba_value is not None:
             self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
             if (
@@ -1158,12 +1161,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # flows, the regular UnifiedRadixCache callback below will adopt the
         # loaded suffix; Mamba flows publish their exact checkpoint here.
         self._prepare_external_slots_for_insert(req)
-        if (
-            flow is None
-            or flow.load is None
-            or flow.total_hit is None
-            or flow.mamba_value is None
-        ):
+        if flow is None or flow.load is None or flow.total_hit is None:
+            return
+        if flow.mamba_value is None:
+            # The regular UnifiedRadixCache callback immediately below adopts
+            # the Full/SWA slots. Its internal rematch must not classify those
+            # same slots as private copies shadowed by another request.
+            flow.loaded_slots_published = True
             return
 
         total_hit = min(flow.total_hit, len(flow.key))
@@ -1237,6 +1241,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None
+        flow.loaded_slots_published = True
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
@@ -1495,9 +1500,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     except Exception:
                         pass
                     connector.complete_load(flow.load, synchronize=False)
-                    self.token_to_kv_pool_allocator.free(
-                        flow.load.device_indices[flow.released_skip_tokens :]
-                    )
+                    if flow.loaded_slots_published:
+                        # The tree owns the published suffix; only a private
+                        # prefix shadowed before insertion remains ours to free.
+                        self._release_unused_loaded_slots(flow)
+                    else:
+                        self.token_to_kv_pool_allocator.free(
+                            flow.load.device_indices[flow.released_skip_tokens :]
+                        )
                     if flow.mamba_value is not None:
                         self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
                         flow.mamba_value = None
