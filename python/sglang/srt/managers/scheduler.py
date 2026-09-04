@@ -3817,6 +3817,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_unified_lmcache
                         or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
