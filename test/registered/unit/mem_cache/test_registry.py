@@ -36,6 +36,7 @@ def _make_ctx(
     enable_streaming=False,
     enable_lmcache=False,
     enable_unified_lmcache=False,
+    enable_unified_cache_external_linker=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
@@ -54,7 +55,7 @@ def _make_ctx(
         enable_lmcache=enable_lmcache,
         enable_unified_lmcache=enable_unified_lmcache,
         enable_flexkv=False,
-        enable_unified_cache_external_linker=False,
+        enable_unified_cache_external_linker=enable_unified_cache_external_linker,
     )
     params = MagicMock()
     params.is_eagle = False
@@ -513,6 +514,15 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             self,
             enable_lmcache=True,
             enable_unified_lmcache=True,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            default_radix_cache_factory(ctx)
+
+    def test_unified_lmcache_and_external_linker_are_mutually_exclusive(self):
+        ctx = _make_ctx(
+            self,
+            enable_unified_lmcache=True,
+            enable_unified_cache_external_linker=True,
         )
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             default_radix_cache_factory(ctx)

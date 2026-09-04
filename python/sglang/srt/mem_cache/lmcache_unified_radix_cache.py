@@ -73,6 +73,8 @@ class _PendingStore:
 class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     """Unified radix tree with device-direct LMCache MP KV/state I/O."""
 
+    storage_backend_type = "LMCacheMP"
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -263,14 +265,42 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
 
         tensors: list[torch.Tensor] = []
-        for pool, field in (
-            (c4_pool, "kv_buffer"),
-            (getattr(kv_pool, "c4_indexer_kv_pool", None), "index_k_with_scale_buffer"),
-            (getattr(kv_pool, "c128_kv_pool", None), "kv_buffer"),
-        ):
-            buffers = getattr(pool, field, None) if pool is not None else None
-            if buffers:
-                tensors.extend(tensor for tensor in buffers if tensor.numel() > 0)
+        c4_buffers = getattr(c4_pool, "kv_buffer", None)
+        if c4_buffers:
+            tensors.extend(tensor for tensor in c4_buffers if tensor.numel() > 0)
+
+        indexer_pool = getattr(kv_pool, "c4_indexer_kv_pool", None)
+        if indexer_pool is not None:
+            if getattr(indexer_pool, "uses_aiter_fp4_layout", False):
+                # AITER stores FP4 payload and scales in separate page-native
+                # tensors. Expose each physical buffer as one opaque byte row
+                # per page so LMCache can register both without a copy.
+                split_buffers = (
+                    getattr(indexer_pool, "index_k_payload_buffer", None),
+                    getattr(indexer_pool, "index_k_scale_buffer", None),
+                )
+                if any(not buffers for buffers in split_buffers):
+                    raise NotImplementedError(
+                        "DeepSeek V4 AITER FP4 indexer is missing payload or scale "
+                        "buffers"
+                    )
+                for buffers in split_buffers:
+                    tensors.extend(
+                        tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
+                        for tensor in buffers
+                        if tensor.numel() > 0
+                    )
+            else:
+                buffers = getattr(indexer_pool, "index_k_with_scale_buffer", None)
+                if buffers:
+                    tensors.extend(
+                        tensor for tensor in buffers if tensor.numel() > 0
+                    )
+
+        c128_pool = getattr(kv_pool, "c128_kv_pool", None)
+        c128_buffers = getattr(c128_pool, "kv_buffer", None)
+        if c128_buffers:
+            tensors.extend(tensor for tensor in c128_buffers if tensor.numel() > 0)
 
         resolved = cls._validate_page_native_tensors("FULL sidecar", tuple(tensors))
         if not resolved:
@@ -785,11 +815,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         mamba_value = None
         allocated_mamba_for_load = False
         if device_indices is not None and self._mamba_component is not None:
-            if req.mamba_pool_idx is None:
+            if req.kv.mamba_pool_idx is None:
                 mamba_value = self._allocate_external_mamba_slot()
                 allocated_mamba_for_load = mamba_value is not None
             else:
-                mamba_value = req.mamba_pool_idx.reshape(1)
+                mamba_value = req.kv.mamba_pool_idx.reshape(1)
         allocation_ok = torch.tensor(
             [
                 int(
@@ -824,8 +854,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.loaded_skip_tokens = 0
         if allocated_mamba_for_load:
             assert mamba_value is not None
-            req.mamba_pool_idx = mamba_value[0]
-            req.mamba_needs_clear = False
+            req.kv.mamba_pool_idx = mamba_value[0]
+            req.kv.mamba_needs_clear = False
 
         try:
             load_start = local_hit // self.lmcache_connector.chunk_size
@@ -851,7 +881,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
-                req.mamba_pool_idx = None
+                req.kv.mamba_pool_idx = None
             flow.mamba_value = None
             flow.allocated_mamba_for_load = False
             flow.load_req = None
@@ -899,12 +929,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if total_hit <= local_hit_tokens:
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+                self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
                 return True
             flow.total_hit = total_hit
             flow.local_hit_tokens = local_hit_tokens
             self.prefetch_loaded_tokens_by_reqid[req_id] = (
                 total_hit - local_hit_tokens
             )
+            self.prefetch_loaded_storage_start_by_reqid[req_id] = local_hit_tokens
 
         if flow.load is not None and flow.load.result is False:
             self._finish_failed_load(flow)
@@ -936,7 +968,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow.free_mamba_after_load and flow.mamba_value is not None:
             self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
             if flow.load_req is not None:
-                flow.load_req.mamba_pool_idx = None
+                flow.load_req.kv.mamba_pool_idx = None
             flow.mamba_value = None
         flow.load_req = None
         flow.free_mamba_after_load = False
@@ -947,6 +979,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         else:
             self.prefetch_loaded_tokens_by_reqid[rid] = 0
+        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         if rid in self._finished_store_requests:
             self._finish_store_session_if_idle(rid)
 
@@ -1003,6 +1036,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     # ------------------------------------------------------------------
@@ -1163,6 +1197,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         self._finished_store_requests.add(rid)
         flow = self._external_flows.get(rid)
         if flow is None:
@@ -1175,7 +1210,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow.load is not None and flow.mamba_value is not None:
             flow.free_mamba_after_load = True
             if flow.load_req is not None:
-                flow.load_req.mamba_pool_idx = None
+                flow.load_req.kv.mamba_pool_idx = None
         if flow.load is None:
             self._external_flows.pop(rid, None)
             self._finish_store_session_if_idle(rid)
@@ -1205,6 +1240,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
             self.prefetch_loaded_tokens_by_reqid.pop(req.rid, None)
+            self.prefetch_loaded_storage_start_by_reqid.pop(req.rid, None)
             self._external_flows.pop(req.rid, None)
             return (
                 self.tree_core.empty_match_result.device_indices,
