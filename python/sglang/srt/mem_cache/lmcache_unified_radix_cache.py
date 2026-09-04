@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -56,6 +57,8 @@ class _ExternalFlow:
     anchor_lock: Optional[DecLockRefParams] = None
     mamba_value: Optional[torch.Tensor] = None
     allocated_mamba_for_load: bool = False
+    request_mamba_value: Optional[torch.Tensor] = None
+    allocated_request_mamba_for_load: bool = False
     load_req: Optional[Req] = None
     free_mamba_after_load: bool = False
     loaded_skip_tokens: int = 0
@@ -600,6 +603,26 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
         return slot
 
+    def _arm_external_mamba_cow(self, flow: _ExternalFlow, req: Req) -> None:
+        """Give a request a mutable state slot and COW from the loaded checkpoint."""
+        checkpoint = flow.mamba_value
+        if checkpoint is None:
+            return
+        if req.kv.mamba_pool_idx is None:
+            active = self._allocate_external_mamba_slot()
+            assert active is not None, (
+                "Cannot allocate Mamba request state for LMCache"
+            )
+            req.kv.mamba_pool_idx = active[0]
+            flow.request_mamba_value = active
+            flow.allocated_request_mamba_for_load = True
+        elif flow.request_mamba_value is None:
+            flow.request_mamba_value = req.kv.mamba_pool_idx.reshape(1)
+            flow.allocated_request_mamba_for_load = False
+        flow.load_req = req
+        req.kv.mamba_cow_src_index = checkpoint
+        req.kv.mamba_needs_clear = False
+
     # ------------------------------------------------------------------
     # Lookup + asynchronous retrieve
     # ------------------------------------------------------------------
@@ -651,9 +674,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 req=req,
             )
         elif flow is not None and flow.load is not None and params.cow_mamba:
-            # The request already owns the Mamba state filled by LMCache. A
-            # retry match must not arm the normal tree-state COW and overwrite
-            # that externally loaded state before forward.
+            # Admission may retry after returning a request-owned active slot.
+            # Re-arm COW from LMCache's immutable checkpoint instead of using
+            # an unrelated tree checkpoint.
+            self._arm_external_mamba_cow(flow, req)
             params = MatchPrefixParams(key=params.key, cow_mamba=False, req=req)
         result = super().match_prefix(params)
         if req is None:
@@ -814,18 +838,29 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         device_indices = self._allocate_external_slots(num_tokens)
         mamba_value = None
         allocated_mamba_for_load = False
+        request_mamba_value = None
+        allocated_request_mamba_for_load = False
         if device_indices is not None and self._mamba_component is not None:
+            # The externally restored checkpoint is immutable tree data.  Keep
+            # it separate from the request's active recurrent state, which the
+            # model mutates during the following prefill/decode.
+            mamba_value = self._allocate_external_mamba_slot()
+            allocated_mamba_for_load = mamba_value is not None
             if req.kv.mamba_pool_idx is None:
-                mamba_value = self._allocate_external_mamba_slot()
-                allocated_mamba_for_load = mamba_value is not None
+                request_mamba_value = self._allocate_external_mamba_slot()
+                allocated_request_mamba_for_load = request_mamba_value is not None
             else:
-                mamba_value = req.kv.mamba_pool_idx.reshape(1)
+                request_mamba_value = req.kv.mamba_pool_idx.reshape(1)
         allocation_ok = torch.tensor(
             [
                 int(
                     device_indices is not None
                     and (
-                        self._mamba_component is None or mamba_value is not None
+                        self._mamba_component is None
+                        or (
+                            mamba_value is not None
+                            and request_mamba_value is not None
+                        )
                     )
                 )
             ],
@@ -838,6 +873,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
+            if (
+                allocated_request_mamba_for_load
+                and request_mamba_value is not None
+            ):
+                self.req_to_token_pool.mamba_allocator.free(request_mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
                 "LMCache retrieve declined for %s: a parallel rank cannot allocate "
@@ -849,12 +889,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         assert device_indices is not None
         flow.mamba_value = mamba_value
         flow.allocated_mamba_for_load = allocated_mamba_for_load
+        flow.request_mamba_value = request_mamba_value
+        flow.allocated_request_mamba_for_load = (
+            allocated_request_mamba_for_load
+        )
         flow.load_req = req
         flow.free_mamba_after_load = allocated_mamba_for_load
         flow.loaded_skip_tokens = 0
-        if allocated_mamba_for_load:
-            assert mamba_value is not None
-            req.kv.mamba_pool_idx = mamba_value[0]
+        if allocated_request_mamba_for_load:
+            assert request_mamba_value is not None
+            req.kv.mamba_pool_idx = request_mamba_value[0]
             req.kv.mamba_needs_clear = False
 
         try:
@@ -877,13 +921,27 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load, self._forward_stream
             ):
                 raise RuntimeError("LMCache server rejected the retrieve request")
+            if mamba_value is not None:
+                # prepare_load_on_stream() first makes the forward stream wait
+                # for LMCache's H2D completion.  The regular deferred Mamba COW
+                # therefore runs afterwards on that same forward stream.
+                self._arm_external_mamba_cow(flow, req)
         except Exception:
             self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
                 self.req_to_token_pool.mamba_allocator.free(mamba_value)
+            if (
+                allocated_request_mamba_for_load
+                and request_mamba_value is not None
+            ):
+                self.req_to_token_pool.mamba_allocator.free(request_mamba_value)
                 req.kv.mamba_pool_idx = None
+            if req.kv.mamba_cow_src_index is mamba_value:
+                req.kv.mamba_cow_src_index = None
             flow.mamba_value = None
             flow.allocated_mamba_for_load = False
+            flow.request_mamba_value = None
+            flow.allocated_request_mamba_for_load = False
             flow.load_req = None
             flow.free_mamba_after_load = False
             self.dec_lock_ref(flow.anchor_node, flow.anchor_lock)
@@ -967,9 +1025,24 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         if flow.free_mamba_after_load and flow.mamba_value is not None:
             self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
-            if flow.load_req is not None:
-                flow.load_req.kv.mamba_pool_idx = None
+            if (
+                flow.load_req is not None
+                and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
+            ):
+                flow.load_req.kv.mamba_cow_src_index = None
             flow.mamba_value = None
+        if (
+            flow.allocated_request_mamba_for_load
+            and flow.request_mamba_value is not None
+            and flow.load_req is not None
+            and flow.load_req.kv.mamba_pool_idx is not None
+            and int(flow.load_req.kv.mamba_pool_idx.item())
+            == int(flow.request_mamba_value[0].item())
+        ):
+            self.req_to_token_pool.mamba_allocator.free(flow.request_mamba_value)
+            flow.load_req.kv.mamba_pool_idx = None
+        flow.request_mamba_value = None
+        flow.allocated_request_mamba_for_load = False
         flow.load_req = None
         flow.free_mamba_after_load = False
         self._release_flow_anchor(flow)
@@ -987,10 +1060,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         """Finish local bookkeeping after LMCache has completed the retrieve."""
         assert flow.load is not None and flow.load.result
         self._release_unused_loaded_slots(flow)
-        flow.mamba_value = None
-        flow.allocated_mamba_for_load = False
-        flow.load_req = None
-        flow.free_mamba_after_load = False
+        # Keep the immutable Mamba checkpoint until the normal request-cache
+        # callback publishes the loaded boundary into the radix tree.
 
     def _retire_loaded_flow(self, rid: str) -> None:
         flow = self._external_flows.get(rid)
@@ -1012,6 +1083,22 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.lmcache_connector.complete_load(flow.load)
         if flow.load.result:
             self._finish_successful_load(flow)
+            if flow.mamba_value is not None:
+                # Successful loads normally transfer checkpoint ownership to
+                # the tree in _publish_external_mamba_checkpoint().  Keep this
+                # fallback for any request path that retires without inserting.
+                if (
+                    flow.load_req is not None
+                    and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
+                ):
+                    flow.load_req.kv.mamba_cow_src_index = None
+                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+                flow.mamba_value = None
+                flow.allocated_mamba_for_load = False
+                flow.free_mamba_after_load = False
+            flow.request_mamba_value = None
+            flow.allocated_request_mamba_for_load = False
+            flow.load_req = None
             self._release_flow_anchor(flow)
             self._external_flows.pop(rid, None)
         else:
@@ -1044,6 +1131,101 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.kv.swa_evicted_seqlen = max(
                 req.kv.swa_evicted_seqlen, swa_missing_end
             )
+
+    def _publish_external_mamba_checkpoint(
+        self, req: Req, *, token_ids_len: int
+    ) -> None:
+        """Publish an LMCache-restored Mamba boundary into the device tree.
+
+        Full/SWA slots loaded by LMCache remain request-owned until this normal
+        cache callback.  At that point insert adopts those same slots and the
+        independent Mamba checkpoint together.  The request active Mamba slot
+        is never inserted because forward has already COW'd the checkpoint into
+        it and may have mutated it.
+        """
+        flow = self._external_flows.get(req.rid)
+        if (
+            flow is None
+            or flow.load is None
+            or flow.total_hit is None
+            or flow.mamba_value is None
+        ):
+            return
+
+        total_hit = min(flow.total_hit, len(flow.key))
+        if total_hit > token_ids_len:
+            raise RuntimeError(
+                "LMCache Mamba checkpoint lies beyond the request KV boundary: "
+                f"{total_hit}>{token_ids_len} for request {req.rid}"
+            )
+        if total_hit <= 0:
+            return
+
+        # Convert the temporary admission ownership boundary back to the
+        # portion already owned by the tree before inserting the loaded suffix.
+        self._prepare_external_slots_for_insert(req)
+        prev_prefix_len = min(req.kv.cache_protected_len, total_hit)
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :token_ids_len
+        ]
+        key = flow.key[:total_hit]
+        checkpoint = flow.mamba_value
+        result = self.insert(
+            InsertParams(
+                key=key,
+                value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
+                mamba_value=checkpoint,
+                prev_prefix_len=prev_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+                chunked=True,
+                priority=getattr(req, "priority", 0) or 0,
+            )
+        )
+
+        # A concurrent request may already have published this exact boundary.
+        # In that case insert keeps the canonical checkpoint and ours remains
+        # caller-owned, so return it exactly once.
+        if result.mamba_exist:
+            self.req_to_token_pool.mamba_allocator.free(checkpoint)
+        flow.mamba_value = None
+        flow.allocated_mamba_for_load = False
+        flow.free_mamba_after_load = False
+
+        matched = super().match_prefix(
+            MatchPrefixParams(key=key, req=req, cow_mamba=False)
+        )
+        if len(matched.device_indices) < total_hit:
+            raise RuntimeError(
+                "LMCache loaded prefix was inserted but is not reusable across "
+                f"all UnifiedRadixCache components: {len(matched.device_indices)}"
+                f"/{total_hit} tokens for request {req.rid}"
+            )
+        canonical = matched.device_indices[:total_hit]
+        self.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(prev_prefix_len, total_hit)),
+            canonical[prev_prefix_len:],
+        )
+
+        # Hand the request lock from its old local boundary to the newly
+        # published boundary.  The flow's independent anchor lock is released
+        # later by _retire_loaded_flow().
+        if req.last_node is not None:
+            self._dec_req_lock(req)
+        lock_result = self.inc_lock_ref(matched.last_device_node)
+        if total_hit < token_ids_len:
+            req.prefix_indices = torch.cat(
+                [canonical, kv_indices[total_hit:].to(dtype=torch.int64, copy=True)]
+            )
+        else:
+            req.prefix_indices = canonical
+        req.kv.cache_protected_len = total_hit
+        req.last_node = matched.last_device_node
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+        req.swa_prefix_lock_released = False
+        flow.request_mamba_value = None
+        flow.allocated_request_mamba_for_load = False
+        flow.load_req = None
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
@@ -1130,6 +1312,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        self._publish_external_mamba_checkpoint(
+            req, token_ids_len=len(req.get_fill_ids())
+        )
         self._prepare_external_slots_for_insert(req)
         super().cache_unfinished_req(req, chunked=chunked, **kwargs)
         self._retire_loaded_flow(req.rid)
@@ -1141,6 +1326,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if not is_insert:
             self.release_aborted_request(req.rid)
         else:
+            self._publish_external_mamba_checkpoint(
+                req, token_ids_len=kv_len_to_handle
+            )
             self._prepare_external_slots_for_insert(req)
         super().cache_finished_req(
             req,
@@ -1217,13 +1405,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._finish_session_if_idle(rid)
             return
         flow.cancelled = True
-        # Generic request cleanup would otherwise return the Mamba slot while
-        # LMCache's CUDA stream may still be writing it. Detach it from the
-        # request and let the completion path free it after the device event.
+        # LMCache writes only the independent checkpoint slot. Generic request
+        # cleanup may therefore release the active slot normally; the flow
+        # keeps the checkpoint alive until its H2D completion is observed.
         if flow.load is not None and flow.mamba_value is not None:
             flow.free_mamba_after_load = True
-            if flow.load_req is not None:
-                flow.load_req.kv.mamba_pool_idx = None
+            if (
+                flow.load_req is not None
+                and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
+            ):
+                flow.load_req.kv.mamba_cow_src_index = None
         if flow.load is None:
             self._external_flows.pop(rid, None)
             self._finish_session_if_idle(rid)
