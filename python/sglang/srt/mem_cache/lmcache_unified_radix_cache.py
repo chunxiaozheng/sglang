@@ -1195,6 +1195,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._finish_store_session_if_idle(pending.operation.request_id)
 
+    def has_pending_cache_operations(self) -> bool:
+        return bool(self._external_flows or self._pending_stores)
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
