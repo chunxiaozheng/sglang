@@ -97,6 +97,11 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "--enable-unified-lmcache and --enable-hierarchical-cache are "
                 "mutually exclusive"
             )
+        if ctx.server_args.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-unified-lmcache and "
+                "--enable-unified-cache-external-linker are mutually exclusive"
+            )
         if ctx.disable_radix_cache:
             raise ValueError(
                 "--enable-unified-lmcache requires radix cache to be enabled"
