@@ -63,7 +63,9 @@ class _ExternalFlow:
     free_mamba_after_load: bool = False
     loaded_skip_tokens: int = 0
     released_skip_tokens: int = 0
-    loaded_slots_published: bool = False
+    prefix_published: bool = False
+    load_completed: bool = False
+    retire_requested: bool = False
     cancelled: bool = False
 
 
@@ -143,7 +145,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[_PendingStore] = []
-        self._finished_requests: set[str] = set()
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self._lmcache_closed = False
         # Kept only for compatibility with the scheduler's existing HiCache
@@ -689,7 +690,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         total_hit = min(flow.total_hit, requested_key_len, len(flow.key))
         local_hit = len(result.device_indices)
         skip = 0
-        if flow.load is not None and not flow.loaded_slots_published:
+        if flow.load is not None and not flow.prefix_published:
             # Another request may publish part or all of this prefix while our
             # retrieve is in flight. Record the shadowed private slots before
             # the fully-local early return below. Once this flow starts its own
@@ -1007,8 +1008,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             self.prefetch_loaded_storage_start_by_reqid[req_id] = local_hit_tokens
 
-        if flow.load is not None and flow.load.result is False:
+        if (
+            flow.load is not None
+            and flow.load_completed
+            and flow.load.result is False
+        ):
+            rid = flow.lookup.request_id
             self._finish_failed_load(flow)
+            logger.warning(
+                "LMCache retrieve failed after admission for request %s", rid
+            )
             return True
         return True
 
@@ -1031,7 +1040,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _finish_failed_load(self, flow: _ExternalFlow) -> None:
         assert flow.load is not None
-        if not flow.loaded_slots_published:
+        if not flow.prefix_published:
             self.token_to_kv_pool_allocator.free(
                 flow.load.device_indices[flow.released_skip_tokens :]
             )
@@ -1066,17 +1075,40 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         else:
             self.prefetch_loaded_tokens_by_reqid[rid] = 0
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
-        if rid in self._finished_requests:
-            self._finish_session_if_idle(rid)
 
     def _finish_successful_load(self, flow: _ExternalFlow) -> None:
         """Finish local bookkeeping after LMCache has completed the retrieve."""
-        assert flow.load is not None and flow.load.result
+        assert flow.load is not None and flow.load_completed and flow.load.result
         self._release_unused_loaded_slots(flow)
         # Keep the immutable Mamba checkpoint until the normal request-cache
         # callback publishes the loaded boundary into the radix tree.
 
+    def _finalize_retired_flow(self, flow: _ExternalFlow) -> None:
+        """Release a successfully loaded flow after its cache callback retired it."""
+        assert flow.load is not None and flow.load_completed and flow.load.result
+        self._finish_successful_load(flow)
+        if flow.mamba_value is not None:
+            # Successful loads normally transfer checkpoint ownership to the
+            # tree in _publish_external_loaded_prefix(). Keep this fallback for
+            # any request path that retires without inserting.
+            if (
+                flow.load_req is not None
+                and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
+            ):
+                flow.load_req.kv.mamba_cow_src_index = None
+            self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+            flow.mamba_value = None
+            flow.allocated_mamba_for_load = False
+            flow.free_mamba_after_load = False
+        flow.request_mamba_value = None
+        flow.allocated_request_mamba_for_load = False
+        flow.load_req = None
+        self._release_flow_anchor(flow)
+        rid = flow.lookup.request_id
+        self._external_flows.pop(rid, None)
+
     def _retire_loaded_flow(self, rid: str) -> None:
+        """Request retirement without entering a readiness-gated collective."""
         flow = self._external_flows.get(rid)
         if flow is None:
             return
@@ -1090,32 +1122,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             self._external_flows.pop(rid, None)
             return
-        if flow.load.result is None:
-            if not flow.load.query():
-                return
-            self.lmcache_connector.complete_load(flow.load)
+
+        flow.retire_requested = True
+        if not flow.load_completed:
+            return
         if flow.load.result:
-            self._finish_successful_load(flow)
-            if flow.mamba_value is not None:
-                # Successful loads normally transfer checkpoint ownership to
-                # the tree in _publish_external_loaded_prefix().  Keep this
-                # fallback for any request path that retires without inserting.
-                if (
-                    flow.load_req is not None
-                    and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
-                ):
-                    flow.load_req.kv.mamba_cow_src_index = None
-                self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
-                flow.mamba_value = None
-                flow.allocated_mamba_for_load = False
-                flow.free_mamba_after_load = False
-            flow.request_mamba_value = None
-            flow.allocated_request_mamba_for_load = False
-            flow.load_req = None
-            self._release_flow_anchor(flow)
-            self._external_flows.pop(rid, None)
+            self._finalize_retired_flow(flow)
         else:
+            cancelled = flow.cancelled
             self._finish_failed_load(flow)
+            if not cancelled:
+                logger.warning(
+                    "LMCache retrieve failed after admission for request %s", rid
+                )
 
     def _prepare_external_slots_for_insert(self, req: Req) -> None:
         """Restore tree ownership and describe LMCache's sparse SWA suffix.
@@ -1167,7 +1186,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             # The regular UnifiedRadixCache callback immediately below adopts
             # the Full/SWA slots. Its internal rematch must not classify those
             # same slots as private copies shadowed by another request.
-            flow.loaded_slots_published = True
+            flow.prefix_published = True
             return
 
         total_hit = min(flow.total_hit, len(flow.key))
@@ -1241,7 +1260,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None
-        flow.loaded_slots_published = True
+        flow.prefix_published = True
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
@@ -1354,19 +1373,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if is_insert:
             token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
             self._submit_store(req, token_ids)
-        self._finished_requests.add(req.rid)
-        self._finish_session_if_idle(req.rid)
-
-    def _finish_session_if_idle(self, rid: str) -> None:
-        if rid not in self._finished_requests:
-            return
-        if self._has_pending_store(rid) or rid in self._external_flows:
-            return
-        self._finished_requests.discard(rid)
-        self.lmcache_connector.finish_request(rid)
-
-    def _has_pending_store(self, rid: str) -> bool:
-        return any(p.operation.request_id == rid for p in self._pending_stores)
+            self.lmcache_connector.finish_request(req.rid)
 
     # ------------------------------------------------------------------
     # Future polling and lifecycle
@@ -1387,15 +1394,24 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         load_flows = [
             flow
             for flow in self._external_flows.values()
-            if flow.load is not None and flow.load.result is None
+            if flow.load is not None and not flow.load_completed
         ]
         ready_loads = self._ready_prefix_count([f.load for f in load_flows])
         for flow in load_flows[:ready_loads]:
             assert flow.load is not None
-            self.lmcache_connector.complete_load(flow.load)
-            if flow.cancelled:
+            success = self.lmcache_connector.complete_load(flow.load)
+            flow.load_completed = True
+            cancelled = flow.cancelled
+            if cancelled or not success:
                 self._finish_failed_load(flow)
-            elif flow.load.result:
+                if not cancelled:
+                    logger.warning(
+                        "LMCache retrieve failed after admission for request %s",
+                        flow.lookup.request_id,
+                    )
+            elif flow.retire_requested:
+                self._finalize_retired_flow(flow)
+            else:
                 self._finish_successful_load(flow)
 
         ready_stores = self._ready_prefix_count(
@@ -1403,9 +1419,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         for _ in range(ready_stores):
             pending = self._pending_stores.pop(0)
-            self.lmcache_connector.complete_store(pending.operation)
-            self.dec_lock_ref(pending.node_id, pending.lock_params)
-            self._finish_session_if_idle(pending.operation.request_id)
+            try:
+                self.lmcache_connector.complete_store(pending.operation)
+            finally:
+                # STORE failure is recoverable, but its source tree node must
+                # never remain protected after the operation has completed.
+                self.dec_lock_ref(pending.node_id, pending.lock_params)
 
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
@@ -1413,10 +1432,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
-        self._finished_requests.add(rid)
         flow = self._external_flows.get(rid)
         if flow is None:
-            self._finish_session_if_idle(rid)
+            self.lmcache_connector.finish_request(rid)
             return
         flow.cancelled = True
         # LMCache writes only the independent checkpoint slot. Generic request
@@ -1438,9 +1456,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 # END_SESSION, issued below, is ordered after the in-flight
                 # LOOKUP and releases any locks it may eventually acquire.
                 self._external_flows.pop(rid, None)
-            self._finish_session_if_idle(rid)
-        elif flow.load.result is not None:
+        elif flow.load_completed:
             self._finish_failed_load(flow)
+        else:
+            # Completion, including its TP/PP collective, is driven only by
+            # check_hicache_events().
+            flow.retire_requested = True
+        self.lmcache_connector.finish_request(rid)
 
     def init_load_back(
         self, params: InitLoadBackParams
@@ -1500,7 +1522,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     except Exception:
                         pass
                     connector.complete_load(flow.load, synchronize=False)
-                    if flow.loaded_slots_published:
+                    flow.load_completed = True
+                    if flow.prefix_published:
                         # The tree owns the published suffix; only a private
                         # prefix shadowed before insertion remains ours to free.
                         self._release_unused_loaded_slots(flow)
@@ -1523,7 +1546,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._external_flows.clear()
             self._pending_stores.clear()
-            self._finished_requests.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()
