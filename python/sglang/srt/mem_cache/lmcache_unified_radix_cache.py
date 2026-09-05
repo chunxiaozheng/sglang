@@ -1008,17 +1008,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             self.prefetch_loaded_storage_start_by_reqid[req_id] = local_hit_tokens
 
-        if (
-            flow.load is not None
-            and flow.load_completed
-            and flow.load.result is False
-        ):
-            rid = flow.lookup.request_id
-            self._finish_failed_load(flow)
-            logger.warning(
-                "LMCache retrieve failed after admission for request %s", rid
-            )
-            return True
         return True
 
     def _release_flow_anchor(self, flow: _ExternalFlow) -> None:
