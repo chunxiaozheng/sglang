@@ -145,6 +145,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._external_flows: dict[str, _ExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[_PendingStore] = []
+        self._pending_store_counts: dict[str, int] = {}
+        self._session_finish_requested: set[str] = set()
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self._lmcache_closed = False
         # Kept only for compatibility with the scheduler's existing HiCache
@@ -1334,6 +1336,23 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._pending_stores.append(
             _PendingStore(operation, matched.last_device_node, lock_params)
         )
+        self._pending_store_counts[req.rid] = (
+            self._pending_store_counts.get(req.rid, 0) + 1
+        )
+
+    def _request_session_finish(self, rid: str) -> None:
+        """End the LMCache session after this request's stores have completed."""
+        self._session_finish_requested.add(rid)
+        self._finish_session_if_store_idle(rid)
+
+    def _finish_session_if_store_idle(self, rid: str) -> None:
+        if (
+            rid not in self._session_finish_requested
+            or self._pending_store_counts.get(rid, 0) > 0
+        ):
+            return
+        self._session_finish_requested.remove(rid)
+        self.lmcache_connector.finish_request(rid)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         self._publish_external_loaded_prefix(
@@ -1362,7 +1381,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if is_insert:
             token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
             self._submit_store(req, token_ids)
-            self.lmcache_connector.finish_request(req.rid)
+            self._request_session_finish(req.rid)
 
     # ------------------------------------------------------------------
     # Future polling and lifecycle
@@ -1408,12 +1427,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         for _ in range(ready_stores):
             pending = self._pending_stores.pop(0)
+            rid = pending.operation.request_id
             try:
                 self.lmcache_connector.complete_store(pending.operation)
             finally:
                 # STORE failure is recoverable, but its source tree node must
                 # never remain protected after the operation has completed.
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
+                remaining = self._pending_store_counts[rid] - 1
+                if remaining > 0:
+                    self._pending_store_counts[rid] = remaining
+                else:
+                    self._pending_store_counts.pop(rid)
+                self._finish_session_if_store_idle(rid)
 
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
@@ -1423,7 +1449,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         flow = self._external_flows.get(rid)
         if flow is None:
-            self.lmcache_connector.finish_request(rid)
+            self._request_session_finish(rid)
             return
         flow.cancelled = True
         # LMCache writes only the independent checkpoint slot. Generic request
@@ -1451,7 +1477,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             # Completion, including its TP/PP collective, is driven only by
             # check_hicache_events().
             flow.retire_requested = True
-        self.lmcache_connector.finish_request(rid)
+        self._request_session_finish(rid)
 
     def init_load_back(
         self, params: InitLoadBackParams
@@ -1535,6 +1561,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self.dec_lock_ref(pending.node_id, pending.lock_params)
             self._external_flows.clear()
             self._pending_stores.clear()
+            self._pending_store_counts.clear()
+            self._session_finish_requested.clear()
             self.prefetch_loaded_tokens_by_reqid.clear()
             connector.end_all_sessions()
         super().reset()
