@@ -1277,22 +1277,42 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if len(key) == 0:
             return
         matched = super().match_prefix(MatchPrefixParams(key=key))
-        prefix_is_resident = torch.tensor(
-            [int(len(matched.device_indices) >= len(key))],
-            dtype=torch.int32,
+        # SWA branching-point caching may publish only the repaired branch in
+        # this callback. Store that safe prefix now; a later callback extends it.
+        resident_len = torch.tensor(
+            [min(len(matched.device_indices), len(key))],
+            dtype=torch.int64,
             device="cpu",
         )
         self._lmcache_all_reduce(
-            prefix_is_resident, torch.distributed.ReduceOp.MIN
+            resident_len, torch.distributed.ReduceOp.MIN
         )
-        if not prefix_is_resident.item():
-            logger.warning(
-                "LMCache store skipped for %s: radix prefix has %d/%d tokens",
+        resident_len = (
+            int(resident_len.item())
+            // self.lmcache_connector.chunk_size
+            * self.lmcache_connector.chunk_size
+        )
+        if resident_len == 0:
+            logger.debug(
+                "LMCache store skipped for %s: radix prefix has no complete "
+                "LMCache chunk (%d/%d tokens)",
                 req.rid,
                 len(matched.device_indices),
                 len(key),
             )
             return
+        if resident_len < len(key):
+            logger.debug(
+                "LMCache store for %s is limited to the common resident prefix: "
+                "%d/%d tokens",
+                req.rid,
+                resident_len,
+                len(key),
+            )
+            key = key[:resident_len]
+            # The original match may end at a deeper node. Re-match the shortened
+            # key so the store lock and any Mamba checkpoint use this exact boundary.
+            matched = super().match_prefix(MatchPrefixParams(key=key))
         lock_params = self.inc_lock_ref(matched.last_device_node).to_dec_params()
         mamba_value = (
             self.tree_core.get_component_device_value(
