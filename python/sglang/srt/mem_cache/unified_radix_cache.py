@@ -364,6 +364,45 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.reset()
         self._reset_full()
 
+    def flush_device_cache(self) -> bool:
+        """Evict L1 entries while retaining HiCache L2 entries."""
+        if self.cache_controller is None or self.host_memory_mode != "cache":
+            logger.warning(
+                "Device-only cache flush requires HiCache host memory mode 'cache'."
+            )
+            return False
+
+        protected = (
+            self.full_protected_size()
+            + self.swa_protected_size()
+            + self.mamba_protected_size()
+        )
+        if protected:
+            logger.warning(
+                "Device cache not flushed because %d cache entries are protected.",
+                protected,
+            )
+            return False
+
+        self.evict(
+            EvictParams(
+                num_tokens=self.full_evictable_size(),
+                swa_num_tokens=self.swa_evictable_size(),
+                mamba_num=self.mamba_evictable_size(),
+            )
+        )
+        remaining = (
+            self.full_evictable_size()
+            + self.swa_evictable_size()
+            + self.mamba_evictable_size()
+        )
+        if remaining:
+            logger.warning(
+                "Device-only cache flush left %d device entries resident.", remaining
+            )
+            return False
+        return True
+
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()

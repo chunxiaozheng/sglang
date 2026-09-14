@@ -299,11 +299,15 @@ class TokenizerControlMixin:
         )
 
     async def flush_cache(
-        self: TokenizerManager, timeout_s: Optional[float] = None
+        self: TokenizerManager,
+        timeout_s: Optional[float] = None,
+        device_only: bool = False,
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
         result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(timeout_s=timeout_s, device_only=device_only)
+            )
         )[0]
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()

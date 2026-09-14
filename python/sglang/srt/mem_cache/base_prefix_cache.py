@@ -350,6 +350,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def reset(self):
         pass
 
+    def flush_device_cache(self) -> bool:
+        """Release device cache entries while preserving host-backed entries."""
+        return False
+
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass

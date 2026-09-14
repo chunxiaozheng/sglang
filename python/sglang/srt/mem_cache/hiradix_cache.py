@@ -798,6 +798,23 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves.clear()
         super().reset()
 
+    def flush_device_cache(self) -> bool:
+        """Evict L1 entries while retaining HiCache L2 entries."""
+        if self.protected_size() > 0:
+            logger.warning(
+                "Device cache not flushed because %d tokens are protected.",
+                self.protected_size(),
+            )
+            return False
+        self.evict(EvictParams(num_tokens=self.evictable_size()))
+        if self.evictable_size() > 0:
+            logger.warning(
+                "Device-only cache flush left %d tokens resident.",
+                self.evictable_size(),
+            )
+            return False
+        return True
+
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
             self.token_to_kv_pool_host.destroy()

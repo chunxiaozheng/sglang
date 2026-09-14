@@ -4953,14 +4953,23 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(self, empty_cache: bool = True, device_only: bool = False):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
+            if device_only:
+                if not self.tree_cache.flush_device_cache():
+                    logger.warning(
+                        "Device-only cache flush is unsupported or could not "
+                        "release every device cache entry."
+                    )
+                    return False
+            else:
+                self.tree_cache.reset()
             self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
+            if not device_only:
+                self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
@@ -4973,7 +4982,12 @@ class Scheduler(
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
-                logger.info("Cache flushed successfully!")
+                if device_only:
+                    logger.info(
+                        "Device cache flushed successfully; host cache preserved!"
+                    )
+                else:
+                    logger.info("Cache flushed successfully!")
             success = True
         else:
             logging.warning(

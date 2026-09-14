@@ -982,12 +982,18 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+async def flush_cache(
+    timeout: float = Query(0.0, ge=0.0),
+    device_only: bool = Query(False),
+):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, device_only=device_only
+    )
     if ret.success:
+        target = "Device cache" if device_only else "Cache"
         content = (
-            "Cache flushed.\nPlease check backend logs for more details. "
+            f"{target} flushed.\nPlease check backend logs for more details. "
             "(When there are running or waiting requests, the operation will not be performed.)\n"
         )
     else:

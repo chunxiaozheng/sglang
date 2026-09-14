@@ -37,7 +37,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
 
         self.assertFalse(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(device_only=False)
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
@@ -47,7 +47,40 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
         self.assertTrue(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(device_only=False)
+
+    def test_device_only_flush_is_forwarded(self):
+        scheduler = self._new_scheduler()
+
+        output = scheduler.flush_wrapper.handle(
+            FlushCacheReqInput(timeout_s=None, device_only=True)
+        )
+
+        self.assertTrue(output.success)
+        scheduler.flush_cache.assert_called_once_with(device_only=True)
+
+    def test_device_only_flush_preserves_host_tree(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+        scheduler.cur_batch_for_debug = MagicMock()
+        scheduler.last_batch = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.tree_cache.flush_device_cache.return_value = True
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.grammar_manager = MagicMock()
+        scheduler.metrics_reporter = MagicMock(is_stats_logging_rank=False)
+        scheduler.draft_worker = None
+
+        success = Scheduler.flush_cache(
+            scheduler, empty_cache=False, device_only=True
+        )
+
+        self.assertTrue(success)
+        scheduler.tree_cache.flush_device_cache.assert_called_once_with()
+        scheduler.tree_cache.reset.assert_not_called()
+        scheduler.token_to_kv_pool_allocator.clear.assert_not_called()
+        scheduler.req_to_token_pool.clear.assert_called_once_with()
 
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
@@ -88,7 +121,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper.check_pending()
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(device_only=False)
         out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertTrue(out.success)
 
