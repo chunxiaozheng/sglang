@@ -17,9 +17,9 @@ The tree only needs a handful of guarded hooks:
 * ``init_load_back``    -> :meth:`UnifiedCacheLinkerWrapper.load_back`
 * ``BackupKV`` actions  -> :meth:`UnifiedCacheLinkerWrapper.offload_nodes`
 
-A load lands in device slots private to the loading request and joins the tree
-only when that request inserts it like any computed KV. A failed load therefore
-reaches nothing but its own requests, which the scheduler aborts.
+Full/SWA loads land in request-private slots. A Mamba load also keeps an
+immutable checkpoint, published only after the load and forward succeed. A
+failed load therefore reaches nothing but its own requests.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
+    InsertParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -299,6 +300,15 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+@dataclass
+class _LoadedMambaCheckpoint:
+    req: Req
+    component: TreeComponent
+    full_transfer: PoolTransfer
+    transfer: PoolTransfer
+    prefix_len: int
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -336,6 +346,9 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids: list[str] = []
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
+        # Mamba loads retain an immutable checkpoint until the loaded prefix is
+        # published. The request advances a separate active state through COW.
+        self._loaded_mamba_checkpoints: dict[str, _LoadedMambaCheckpoint] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
@@ -596,10 +609,10 @@ class UnifiedCacheLinkerWrapper:
     def load_back(self, req: Req) -> tuple[int, NodeId]:
         """Queue the external hit into device slots owned by ``req``.
 
-        The loaded tail extends the request's prefix but stays out of the
-        tree (``req.last_node`` is unchanged): the request inserts it like
-        computed KV after its forward, once :meth:`finish_loads` has confirmed
-        the load.
+        The loaded Full/SWA tail extends the request's private prefix while
+        ``req.last_node`` stays unchanged. Mamba additionally stages an
+        immutable checkpoint that :meth:`finish_loads` publishes after the
+        forward succeeds.
         """
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
@@ -651,6 +664,17 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+        for component, transfer in component_transfers:
+            if transfer.name == PoolName.MAMBA:
+                assert transfer.device_indices is not None
+                self._loaded_mamba_checkpoints[req.rid] = _LoadedMambaCheckpoint(
+                    req=req,
+                    component=component,
+                    full_transfer=full_transfer,
+                    transfer=transfer,
+                    prefix_len=prefix_len,
+                )
+                break
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
@@ -789,16 +813,108 @@ class UnifiedCacheLinkerWrapper:
         for rid in rids:
             self.private_load_indices.pop(rid, None)
         if landed.item():
+            for rid in rids:
+                loaded = self._loaded_mamba_checkpoints.get(rid)
+                if loaded is not None:
+                    self._publish_loaded_prefix(loaded.req)
             return []
+        for rid in rids:
+            self._release_loaded_mamba_checkpoint(rid)
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
         )
         return rids
 
+    def _publish_loaded_prefix(self, req: Req) -> None:
+        """Publish an immutable externally loaded Mamba checkpoint."""
+        loaded = self._loaded_mamba_checkpoints.get(req.rid)
+        if loaded is None:
+            return
+
+        cache = self.cache
+        prefix_len = loaded.prefix_len
+        if prefix_len > len(req.full_untruncated_fill_ids):
+            raise RuntimeError(
+                "External Mamba checkpoint lies beyond the request KV boundary: "
+                f"{prefix_len}>{len(req.full_untruncated_fill_ids)} for {req.rid}"
+            )
+        key = RadixKey(
+            req.full_untruncated_fill_ids[:prefix_len],
+            req.extra_key,
+            is_bigram=cache.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(cache.page_size)
+        prefix_len = len(key)
+        checkpoint = loaded.transfer.device_indices
+        assert checkpoint is not None
+        previous_node = req.last_node
+        previous_prefix_len = min(req.kv.cache_protected_len, prefix_len)
+        kv_indices = cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :prefix_len
+        ]
+
+        result = cache.insert(
+            InsertParams(
+                key=key,
+                value=kv_indices.to(dtype=torch.int64, copy=True),
+                mamba_value=checkpoint,
+                prev_prefix_len=previous_prefix_len,
+                component_evicted_seqlens=req.kv.copy_evicted_seqlens(),
+                inserted_len=prefix_len,
+                priority=req.priority or 0,
+                session_id=req.session_id,
+                rotation_base=req.kv_rotation_base,
+            )
+        )
+        if result.rotation_tail_declined:
+            self._release_loaded_mamba_checkpoint(req.rid)
+            return
+
+        if result.mamba_exist:
+            self._release_loaded_mamba_checkpoint(req.rid)
+        else:
+            self._loaded_mamba_checkpoints.pop(req.rid)
+
+        new_last_node = result.last_device_node
+        cache.tree_core.mark_external_cache_stored_path(new_last_node, previous_node)
+        canonical = cache.path_device_indices(new_last_node)[:prefix_len]
+        if len(canonical) != prefix_len:
+            raise RuntimeError(
+                "Externally loaded prefix was inserted with incomplete KV: "
+                f"{len(canonical)}/{prefix_len} tokens for request {req.rid}"
+            )
+        cache.req_to_token_pool.write(
+            (
+                req.kv.req_pool_idx,
+                slice(previous_prefix_len, prefix_len),
+            ),
+            canonical[previous_prefix_len:],
+        )
+        cache.unlock(req.lock)
+        req.lock = cache.lock(new_last_node)
+        req.kv.protect_prefix(prefix_len)
+        req.last_node = new_last_node
+
+    def _release_loaded_mamba_checkpoint(self, rid: str) -> None:
+        loaded = self._loaded_mamba_checkpoints.pop(rid, None)
+        if loaded is None:
+            return
+        if loaded.req.kv.mamba_cow_src_index is loaded.transfer.device_indices:
+            loaded.req.kv.mamba_cow_src_index = None
+        loaded.component.update_external_linker_load(
+            ExternalLinkerLoadPhase.ABORT,
+            loaded.req,
+            loaded.full_transfer,
+            loaded.transfer,
+            loaded.prefix_len,
+        )
+
     # ---- lifecycle ----
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        for rid in list(self._loaded_mamba_checkpoints):
+            self._release_loaded_mamba_checkpoint(rid)
         self.hit_markers.clear()
         self.prefetches.clear()
         self.inflight_load_rids.clear()
@@ -822,9 +938,14 @@ class UnifiedCacheLinkerWrapper:
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
+            self._release_loaded_mamba_checkpoint(rid)
+        elif rid not in self.inflight_load_rids:
+            self._release_loaded_mamba_checkpoint(rid)
 
     def close(self) -> None:
         self.cache_linker.close()
+        for rid in list(self._loaded_mamba_checkpoints):
+            self._release_loaded_mamba_checkpoint(rid)
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()

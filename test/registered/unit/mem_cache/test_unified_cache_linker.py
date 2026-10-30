@@ -799,7 +799,8 @@ class TestUnifiedCacheLinkerPythonBackend(
 
         return consumer, consumer_req_pool, consumer_linker
 
-    def test_mamba_state_round_trips_only_at_its_checkpoint(self):
+    def test_mamba_loaded_checkpoint_is_reused_after_request_advances(self):
+        """A restored checkpoint must remain reusable after its request advances."""
         tokens = list(range(1, 7))
         consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
             tokens
@@ -835,8 +836,11 @@ class TestUnifiedCacheLinkerPythonBackend(
         }
         self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
         self.assertEqual(loads[PoolName.MAMBA].keys, loads[PoolName.KV].keys[-1:])
-        loaded_state = loads[PoolName.MAMBA].device_indices
-        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        loaded_checkpoint = loads[PoolName.MAMBA].device_indices
+        self.assertNotEqual(int(req.kv.mamba_pool_idx), int(loaded_checkpoint))
+        self.assertTrue(
+            torch.equal(req.kv.mamba_cow_src_index, loaded_checkpoint)
+        )
         self.assertFalse(req.kv.mamba_needs_clear)
 
         loaded_indices = consumer.linker.private_load_indices[req.rid]
@@ -845,13 +849,34 @@ class TestUnifiedCacheLinkerPythonBackend(
             consumer, consumer_req_pool, req, tokens, loaded_indices
         )
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+
+        # The forward consumes the deferred COW and advances the request state
+        # beyond the external boundary before the request is checkpointed.
+        req.kv.mamba_cow_src_index = None
+        extended_tokens = tokens + [7, 8]
+        tail = self._alloc(consumer.token_to_kv_pool_allocator, 2)
+        consumer_req_pool.write((req.kv.req_pool_idx, slice(6, 8)), tail)
+        req.origin_input_ids = array("q", extended_tokens)
+        req.full_untruncated_fill_ids = array("q", extended_tokens)
+        req.extend_end = len(extended_tokens)
+        req.kv.kv_committed_len = len(extended_tokens)
+        req.kv.kv_allocated_len = len(extended_tokens)
+        req.kv.mamba_last_track_seqlen = len(extended_tokens)
         consumer.checkpoint(req, up_to=req.extend_end)
         consumer.unlock(req.lock)
         req.lock = None
+
+        lookup_count = len(consumer_linker.lookup_calls)
+        reuse_req = self._make_req(consumer_req_pool)
         final_match = consumer.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)), req=reuse_req, cow_mamba=True
+            )
         )
         self.assertEqual(final_match.device_prefix_len, len(tokens))
+        self.assertEqual(final_match.host_hit_length, 0)
+        self.assertIsNotNone(reuse_req.kv.mamba_cow_src_index)
+        self.assertEqual(len(consumer_linker.lookup_calls), lookup_count)
         for _ in consumer_linker.offload_calls:
             consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
@@ -878,6 +903,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         self._apply_match_to_req(req, match)
         allocator = consumer_req_pool.mamba_allocator
         before = allocator.available_size()
+        active_state = req.kv.mamba_pool_idx
 
         consumer.init_load_back(
             InitLoadBackParams(
@@ -886,18 +912,29 @@ class TestUnifiedCacheLinkerPythonBackend(
                 req=req,
             )
         )
-        # The CoW from the shorter checkpoint would overwrite the loaded state.
-        loaded_state = next(
+        # Replace the shorter COW source, but keep the request's active slot.
+        loaded_checkpoint = next(
             transfer.device_indices
             for transfer in consumer_linker.queued_loads[req.rid]
             if transfer.name == PoolName.MAMBA
         )
-        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
-        self.assertIsNone(req.kv.mamba_cow_src_index)
-        self.assertEqual(allocator.available_size(), before)
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(active_state))
+        self.assertTrue(
+            torch.equal(req.kv.mamba_cow_src_index, loaded_checkpoint)
+        )
+        self.assertEqual(allocator.available_size(), before - 1)
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        loaded_indices = consumer.linker.private_load_indices[req.rid]
+        self._bind_loaded_request(
+            consumer, consumer_req_pool, req, tokens, loaded_indices
+        )
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.unlock(req.lock)
+        req.lock = None
+        for _ in consumer_linker.offload_calls:
+            consumer_linker.complete_next_offload(True)
+        consumer.check_hicache_events()
         consumer.sanity_check()
 
 

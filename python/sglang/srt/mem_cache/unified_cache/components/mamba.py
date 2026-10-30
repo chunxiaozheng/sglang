@@ -771,11 +771,14 @@ class MambaComponent(TreeComponent):
             return None
 
         assert phase == ExternalLinkerLoadPhase.PREPARE
-        if req.kv.holds_mamba:
-            storage.free_state_slots(sub_pool, req.kv.mamba_pool_idx.unsqueeze(0))
-        # The layer-gated load writes the request's private state directly.
-        req.kv.mamba_pool_idx = transfer.device_indices[0]
-        self._adopt_loaded_state(req)
+        if not req.kv.holds_mamba:
+            req.kv.mamba_pool_idx = self._alloc_mamba_slot(req)[0]
+        # Keep the loaded checkpoint immutable for publication into the tree.
+        # The forward copies it into the request's active slot after the state
+        # layer's load gate opens, then advances only that private copy.
+        storage.restart_replay(sub_pool, req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_cow_src_index = transfer.device_indices
+        req.kv.mamba_needs_clear = False
         return transfer
 
     def _adopt_loaded_state(self, req: Req) -> None:
